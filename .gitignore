@@ -1,0 +1,23 @@
+# Build outputs (reproducible via `make` / `make shaders`)
+/build/
+
+# Compiler / linker intermediates
+*.o
+*.ll
+*.bc
+
+# Compiled GPU code objects (keep sources: shaders/*.s, shaders/*.cl)
+shaders/*.hsaco
+
+# IDE and local tool state
+.cursor/
+.omp/
+
+# Generated runtime output
+triangle.ppm
+*.ppm
+
+# Large local checkouts (clone separately or use submodules)
+/ref/
+/mgpusim/
+/navisim/
