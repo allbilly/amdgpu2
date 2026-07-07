@@ -14,8 +14,11 @@ and PM4 path using linux amdgpu headers as reference.
 Usage:
   python3 examples_egpu/add.py --probe          # eGPU + register sanity (no boot)
   python3 examples_egpu/add.py --selftest         # offline PM4 + shader gate
-  python3 examples_egpu/add.py --reset           # TinyGPU PCI software reset
-  python3 examples_egpu/add.py --boot-stage=smc   # incremental boot debug
+  python3 examples_egpu/add.py --reset           # auto reset (AMD cfg if PCI up, else PCI hot reset)
+  python3 examples_egpu/add.py --reset=aggressive # PCI + AMD cfg + PCI
+  python3 examples_egpu/add.py --reset=mmio        # GRBM/SRBM soft reset only (PCI must be up)
+  AMD_RESET_MODE=gentle|amd_cfg|pci|full python3 add.py --reset
+  python3 examples_egpu/add.py --atom-info       # parse VBIOS ATOM tables (needs GPU)
   python3 examples_egpu/add.py                    # boot + add kernel
 """
 from __future__ import annotations
@@ -91,6 +94,22 @@ class MMIOInterface:
   def view(self, offset=0, size=None, fmt=None):
     sz = (self.nbytes - offset) if size is None else size
     return MMIOInterface(self.addr + offset, sz, fmt=fmt or self.fmt)
+
+def sysmem_dma_flush(mem, size: int):
+  """Flush CPU writes so eGPU DMA sees host memory (ARM lacks IO coherency).
+
+  See geerlingguy/raspberry-pi-pcie-devices#756 — Pi5/M1 need explicit sync for
+  GPU DMA to see CPU-written sysmem (yanghaku pgprot_dmacoherent TTM patch).
+  """
+  if os.environ.get("AMD_BOOT_SYSMEM_FLUSH", "1") == "0":
+    return
+  if not hasattr(mem, "addr") or not size:
+    return
+  libc = ctypes.CDLL(ctypes.util.find_library("c"))
+  MS_SYNC = 0x10
+  if libc.msync(ctypes.c_void_p(mem.addr), size, MS_SYNC) != 0:
+    with contextlib.suppress(Exception):
+      libc.sync()
 
 class FileIOInterface:
   def __init__(self, fd=None):
@@ -230,6 +249,8 @@ class RemotePCIDevice:
     mode = mode or os.environ.get("AMD_RESET_MODE", "auto")
     wait_s = float(os.environ.get("AMD_EGPU_RESET_WAIT_S", wait_s))
     vid = self.read_config(0, 2) & 0xffff
+    if mode == "mmio":
+      return vid, self.read_config(2, 2) & 0xffff
 
     def do_pci():
       self.reset()
@@ -245,7 +266,6 @@ class RemotePCIDevice:
     strategies = {
       "pci": [do_pci],
       "amd_cfg": [try_amd_cfg],
-      "mmio": [],  # MMIO only handled by PolarisDevice
       "gentle": [try_amd_cfg, do_pci],
       "full": [try_amd_cfg, do_pci, try_amd_cfg],
       "aggressive": [do_pci, try_amd_cfg, do_pci],
@@ -254,20 +274,21 @@ class RemotePCIDevice:
 
     if mode == "auto":
       if vid == 0xffff:
-        steps = strategies["aggressive"]
+        steps = []  # never hot-reset a missing device
       elif vid == 0x1002:
-        steps = [try_amd_cfg]  # AMD cfg reset when PCI still visible
+        steps = [try_amd_cfg]
       else:
         steps = [do_pci]
 
     attempts = max(1, int(os.environ.get("AMD_EGPU_RESET_ATTEMPTS", 3)))
+    per_try = wait_s / attempts if vid != 0xffff else wait_s
     for i in range(attempts):
-      if i:
+      if i and steps:
         print(f"polaris: reset retry {i + 1}/{attempts} mode={mode}", flush=True)
-        time.sleep(min(0.5 * (2 ** i), 3.0))
+        time.sleep(min(0.5 * (2 ** i), 2.0))
       for step in steps:
         step()
-      vid, did = self.poll_config(wait_s=wait_s / attempts)
+      vid, did = self.poll_config(wait_s=per_try)
       if vid == 0x1002:
         time.sleep(float(os.environ.get("AMD_BOOT_SMC_SETTLE_MS", 250)) / 1000.0)
         return vid, did
@@ -422,32 +443,60 @@ class PolarisDevice:
       print(f"polaris: pci={vid:04x}:{did:04x} bar0={self.bar0_size:#x} grbm={self.mmio[REG_GRBM_STATUS]:#x} mec={self.mmio[REG_CP_MEC_CNTL]:#x}")
 
   @classmethod
+  def _read_pci_ids(cls, pci: APLRemotePCIDevice, retries: int = 5, delay_s: float = 0.2) -> tuple[int, int]:
+    """Config reads can transiently return 0xffff on TB eGPU — retry before reset."""
+    vid = did = 0xffff
+    for _ in range(max(1, retries)):
+      vid = pci.read_config(0, 2) & 0xffff
+      did = pci.read_config(2, 2) & 0xffff
+      if vid == cls.PCI_VID_AMD:
+        return vid, did
+      if vid != 0xffff:
+        break
+      time.sleep(delay_s)
+    return vid, did
+
+  @classmethod
   def _open_config(cls, pci: APLRemotePCIDevice, reset: bool = False, reset_mode: str = "auto") -> tuple[int, int]:
-    vid = pci.read_config(0, 2) & 0xffff
-    did = pci.read_config(2, 2) & 0xffff
+    vid, did = cls._read_pci_ids(pci)
     auto = getenv("AMD_EGPU_NO_AUTO_RESET", 0) == 0
     mode = reset_mode or os.environ.get("AMD_RESET_MODE", "auto")
-    attempts = int(getenv("AMD_EGPU_RESET_ATTEMPTS", 4 if vid == 0xffff else 2))
+    if mode == "mmio" and vid == 0xffff:
+      raise RuntimeError("MMIO reset needs PCI visible (vid=0xffff) — replug USB4 cable first")
     if vid == cls.PCI_VID_AMD and not reset:
       return vid, did
+    # vid=0xffff: only TinyGPU server restart — PCI hot reset cannot recover missing device
+    if vid == 0xffff and not reset:
+      if getenv("AMD_EGPU_RESTART_SERVER", 1):
+        print("polaris: pci=0xffff — restarting TinyGPU server (no PCI hot reset)", flush=True)
+        pci.restart_server()
+        time.sleep(2.0)
+        vid, did = cls._read_pci_ids(pci, retries=12, delay_s=0.5)
+        if vid == cls.PCI_VID_AMD:
+          print(f"polaris: pci back {vid:04x}:{did:04x}", flush=True)
+          return vid, did
+      raise RuntimeError(
+        "GPU fell off PCIe (config vid=0xffff). Replug USB4 cable, then: "
+        "python3 add.py --probe"
+      )
     if not (reset or (auto and vid != cls.PCI_VID_AMD)):
       raise RuntimeError(f"Expected AMD GPU ({cls.PCI_VID_AMD:#06x}), got {vid:#06x}")
+    attempts = 1 if vid == 0xffff else int(getenv("AMD_EGPU_RESET_ATTEMPTS", 2))
     for i in range(attempts):
       if vid == cls.PCI_VID_AMD and reset and i == 0:
         print(f"polaris: reset mode={mode} (requested)", flush=True)
       elif vid != cls.PCI_VID_AMD:
         print(f"polaris: pci={vid:#06x} — reset attempt {i + 1}/{attempts} mode={mode}", flush=True)
-        if vid == 0xffff and i == 0 and getenv("AMD_EGPU_RESTART_SERVER", 1):
-          print("polaris: restarting TinyGPU server", flush=True)
-          pci.restart_server()
+      if vid == 0xffff and mode not in ("aggressive", "pci", "full", "gentle"):
+        break
       vid, did = pci.software_reset(wait_s=float(getenv("AMD_EGPU_RESET_WAIT_S", 8)), mode=mode)
       if vid == cls.PCI_VID_AMD:
         print(f"polaris: reset ok pci={vid:04x}:{did:04x}", flush=True)
         return vid, did
     if vid == 0xffff:
       raise RuntimeError(
-        "GPU fell off PCIe (config vid=0xffff). Tried PCI/AMD-cfg reset — replug USB4 cable, "
-        "then: AMD_RESET_MODE=aggressive python3 add.py --reset"
+        "GPU fell off PCIe (config vid=0xffff). Replug USB4 cable, then: "
+        "python3 add.py --probe"
       )
     raise RuntimeError(f"AMD GPU not reachable after reset (last vid={vid:#06x})")
 
@@ -524,10 +573,12 @@ class PolarisDevice:
     return max(1, int(getenv("AMD_BOOT_ATTEMPTS", 2)))
 
   def _should_retry_after_error(self, err: BaseException) -> bool:
-    if getenv("AMD_EGPU_NO_AUTO_RESET", 0):
+    if getenv("AMD_EGPU_NO_AUTO_RESET", 0) or getenv("AMD_BOOT_RESET", 1) == 0:
       return False
     msg = str(err).lower()
     if "fell off pcie" in msg or "vid=0xffff" in msg:
+      return False
+    if "rpc failed" in msg or "tinygpu" in msg:
       return False
     return True
 
@@ -549,7 +600,7 @@ class PolarisDevice:
         last_err = e
         if attempt + 1 >= attempts or not self._should_retry_after_error(e):
           raise
-        print(f"polaris: boot failed ({e}); retrying after software reset", flush=True)
+        print(f"polaris: boot failed ({e}); retrying", flush=True)
     if last_err:
       raise last_err
 
@@ -625,10 +676,11 @@ def probe():
   print(f"CONFIG_MEMSIZE={boot.rreg(0x150a):#x} MC_VM_FB_LOCATION={boot.rreg(0x809):#x}")
   bar0_ok = boot.probe_bar0_writes()
   print(f"BAR0 writes={'ok' if bar0_ok else 'FAIL'}")
-  boot.gmc_sw_init()
-  boot.mc_program()
-  mm_ok = boot.probe_vram_mm_writes()
-  print(f"MM_INDEX VRAM writes={'ok' if mm_ok else 'FAIL'}")
+  if getenv("AMD_PROBE_MC", 0):
+    boot.gmc_sw_init()
+    boot.mc_program()
+    mm_ok = boot.probe_vram_mm_writes()
+    print(f"MM_INDEX VRAM writes={'ok' if mm_ok else 'FAIL'}")
   with contextlib.suppress(Exception):
     mem, paddrs, _ = boot.alloc_sysmem_buffer(0x1000, contiguous=True)
     if paddrs:
@@ -651,9 +703,24 @@ def reset_gpu(mode: str = "auto"):
   print(f"reset ok pci=1002:{dev.pci.read_config(2, 2) & 0xffff:04x} "
         f"GRBM_STATUS={dev.reg(REG_GRBM_STATUS):#x} CONFIG_MEMSIZE={memsize:#x}")
 
+def atom_info_cmd():
+  from polaris_boot import PolarisBoot
+  from atom_replay import read_vbios_rom, atom_info, need_asic_init
+  dev = PolarisDevice()
+  boot = PolarisBoot(dev)
+  boot.enable_vbios_rom()
+  bios = read_vbios_rom(boot)
+  info = atom_info(bios)
+  print(f"vbios_len={info['bios_len']} asic_init_off={info['asic_init_off']:#x}")
+  print(f"def_sclk={info['def_sclk']:#x} def_mclk={info['def_mclk']:#x} iio={info['iio_tables']}")
+  print(f"need_asic_init={need_asic_init(boot)} CONFIG_MEMSIZE={boot.rreg(0x150a):#x} "
+        f"scratch7={boot.rreg(0x5d0):#x} MISC0={boot.rreg(0xa80):#x}")
+
 def main():
   if "--probe" in sys.argv:
     probe(); return
+  if "--atom-info" in sys.argv:
+    atom_info_cmd(); return
   if "--selftest" in sys.argv:
     selftest(); return
   reset_mode = "auto"

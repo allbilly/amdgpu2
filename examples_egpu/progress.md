@@ -50,12 +50,46 @@ PYTHONUNBUFFERED=1 DEBUG=1 AMD_BOOT_FORCE_HYBRID=1 python3 add.py
 AMD_BOOT_FW_MINIMAL=1 AMD_BOOT_FW_MASK=0x400 DEBUG=1 python3 add.py  # RLC only
 ```
 
-### Still blocked
+### ARM I/O coherency ([rpi-pcie #756](https://github.com/geerlingguy/raspberry-pi-pcie-devices/discussions/756))
 
-- MM_INDEX VRAM probe failed on last GPU-attached run (readback ≠ written)
-- GPU fell off PCIe (`vid=0xffff`) during reset — needs cable replug to retest
-- If MM_INDEX works: hybrid should fix LoadUcodes (SMC reads TOC from VRAM, fw from AGP)
-- If AGP DMA unreachable over TB: need TinyGPU IOMMU mapping verification
+M1 Mac + Thunderbolt eGPU shares the Pi 5 problem: **CPU cache writes to sysmem may not be visible to GPU DMA**.
+
+- SMC accepts `DRV_DRAM`/`SMU_DRAM` addresses (`resp=0x1`) but **`LoadUcodes` hangs** — likely reading empty/stale GART-backed fw_buf
+- Pi fix (yanghaku): `pgprot_dmacoherent()` in TTM for ARM64
+- Our fix: `sysmem_dma_flush()` via `msync(MS_SYNC)` before LoadUcodes (`AMD_BOOT_SYSMEM_FLUSH=1`, default on)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AMD_BOOT_SYSMEM_FLUSH` | `1` | Flush CPU cache on fw_buf before SMC DMA read |
+
+### Missing ATOM `asic_init` (root architectural gap)
+
+Linux hot-plug works because **amdgpu replays VBIOS in software**, not because BIOS ran first:
+
+```
+amdgpu_device_init()
+  → amdgpu_read_bios_from_rom()
+  → amdgpu_atombios_init()
+  → amdgpu_device_need_post()?   # scratch[7] missing ATOM_S7_ASIC_INIT_COMPLETE
+  → amdgpu_device_asic_init()
+       → amdgpu_atom_asic_init()  # Polaris VI
+            → amdgpu_atom_execute_table(ATOM_CMD_INIT)   # asic_init bytecode
+  → amdgpu_device_ip_init()      # SMC, mc_program, LoadUcodes, gart, ...
+```
+
+**We have:** `enable_vbios_rom()` + ROM magic `0xe974aa55`  
+**We lack:** ATOM interpreter — nobody runs `ATOM_CMD_INIT`
+
+**False skip (fixed):** `MC_IO_DEBUG_UP_13` bit 23 can be set while `CONFIG_MEMSIZE=0` — partial state, not trained VRAM. `load_mc_firmware()` now requires `MISC0|0x80` **and** valid `CONFIG_MEMSIZE`.
+
+**Paths:** (B) trace Linux `asic_init` reg writes → `AMD_BOOT_ATOM_REPLAY=trace.json`; (A) Python `atom_replay.py` runs `ATOM_CMD_INIT` from ROM (default `AMD_BOOT_ATOM_INIT=1`).
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AMD_BOOT_ATOM_INIT` | `1` | Run ATOM asic_init from VBIOS ROM before SMC boot |
+| `AMD_BOOT_ATOM_FORCE` | `0` | Force asic_init even if scratch says done |
+| `AMD_BOOT_ATOM_REPLAY` | — | JSON register trace from Linux (path B) |
+| `AMD_BOOT_DUMP_VBIOS` | — | Write full VBIOS ROM to file |
 
 ---
 

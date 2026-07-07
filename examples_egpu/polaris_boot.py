@@ -759,6 +759,18 @@ class PolarisBoot:
     self.wreg(mmMC_SEQ_IO_DEBUG_INDEX, 0xd)  # ixMC_IO_DEBUG_UP_13
     return self.rreg(mmMC_SEQ_IO_DEBUG_DATA)
 
+  def config_memsize_mb(self) -> int:
+    return self.rreg(mmCONFIG_MEMSIZE) & 0xffff
+
+  def vram_trained(self) -> bool:
+    """True when VBIOS/asic_init or MC ucode left VRAM in a usable state."""
+    misc0 = self.rreg(mmMC_SEQ_MISC0)
+    mem_mb = self.config_memsize_mb()
+    if mem_mb not in (0, 0xffff) and (misc0 & 0x80):
+      return True
+    # bit 23 alone means MC ucode ran once, not that asic_init completed
+    return False
+
   def mc_vbios_trained(self) -> bool:
     """VBIOS MC ucode loaded (smu7_check_mc_firmware bit 23)."""
     return bool(self.mc_io_debug_up13() & (1 << 23))
@@ -918,10 +930,10 @@ class PolarisBoot:
 
   def load_mc_firmware(self):
     misc0 = self.rreg(mmMC_SEQ_MISC0)
-    if misc0 & 0x80 or self.mc_vbios_trained():
+    if self.vram_trained():
       if int(os.environ.get("DEBUG", "0")):
         up13 = self.mc_io_debug_up13()
-        print(f"polaris: MC skip load MISC0={misc0:#x} UP_13={up13:#x}", flush=True)
+        print(f"polaris: MC skip load MISC0={misc0:#x} UP_13={up13:#x} MEMSIZE={self.config_memsize_mb()}", flush=True)
       self.mc_init_locations()
       self.dev._vram_start = self.vram_visible_mc
       self.mc_program_fb_location()
@@ -1144,6 +1156,15 @@ class PolarisBoot:
     if self.gart_pte_mem is None:
       self.gart_enable()
 
+  def _flush_fw_sysmem(self, layout: str, fw_mem):
+    """ARM/M1: CPU cache may hide sysmem writes from eGPU DMA (rpi-pcie #756)."""
+    if layout not in ("hybrid", "agp", "gtt") or fw_mem is None:
+      return
+    from add import sysmem_dma_flush
+    sysmem_dma_flush(fw_mem, SMU_FW_BUF_SIZE)
+    if int(os.environ.get("DEBUG", "0")):
+      print("polaris: sysmem_dma_flush fw_buf", flush=True)
+
   def load_ip_firmware(self):
     """Linux smu7_request_smu_load_fw — runs before gmc_v8_0_gart_enable on VI."""
     if not self.smc_running():
@@ -1163,7 +1184,6 @@ class PolarisBoot:
     use_phys = layout in ("agp",) or os.environ.get("AMD_BOOT_FW_PHYS_ADDR", "0") == "1"
 
     if layout == "hybrid":
-      # Linux VI: header/smu in VRAM; fw_buf uses GART VA (AGP disabled on gmc_v8).
       self.ensure_gart_ready()
       smu_dram_off = round_up(0x100000, PAGE_SIZE)
       hdr_off = round_up(smu_dram_off + SMU_FW_BUF_SIZE, PAGE_SIZE)
@@ -1263,7 +1283,7 @@ class PolarisBoot:
       for ucode_id, ver, addr, sz, flags in entries:
         toc += pack_smu_toc_entry(ucode_id, ver, addr, sz, flags)
     if layout == "hybrid":
-      if not mm_ok and os.environ.get("AMD_BOOT_FORCE_HYBRID", "0") != "1":
+      if not mm_ok and os.environ.get("AMD_BOOT_FORCE_HYBRID", "1") != "1":
         raise RuntimeError("hybrid layout needs MM_INDEX VRAM writes (BAR0 dead and MM_INDEX probe failed; set AMD_BOOT_FORCE_HYBRID=1 to try anyway)")
       if not mm_ok and int(os.environ.get("DEBUG", "0")):
         print("polaris: WARNING hybrid layout with failed MM_INDEX probe", flush=True)
@@ -1278,6 +1298,7 @@ class PolarisBoot:
         self.dev.upload(hdr_off, toc)
       else:
         self.vram_mm_write(hdr_gpu, toc)
+    self._flush_fw_sysmem(layout, fw_mem if layout in ("hybrid", "agp", "gtt") else None)
     self.vram_flush()
     if int(os.environ.get("DEBUG", "0")):
       soft = self.read_soft_regs_start()
@@ -1289,6 +1310,11 @@ class PolarisBoot:
     if int(os.environ.get("DEBUG", "0")):
       pre = self.smc_soft_reg(ixSMU74_UcodeLoadStatus)
       print(f"polaris: UcodeLoadStatus before LoadUcodes={pre}", flush=True)
+    settle = self._settle_s()
+    if settle > 0:
+      time.sleep(settle)
+    self.dev.pci.drain_mmio(bar=5, reg=0x2004)
+    self._check_pci("LoadUcodes prep")
     self.smc_send_msg(PPSMC_MSG_SMU_DRAM_ADDR_HI, smu_dram_gpu >> 32, label="SMU_DRAM_HI")
     self.smc_send_msg(PPSMC_MSG_SMU_DRAM_ADDR_LO, smu_dram_gpu & 0xffffffff, label="SMU_DRAM_LO")
     self.smc_send_msg(PPSMC_MSG_DRV_DRAM_ADDR_HI, hdr_gpu >> 32, label="DRV_DRAM_HI")
@@ -1350,8 +1376,11 @@ class PolarisBoot:
   def boot(self):
     if self.dev.gpu_ready():
       return
-    # Linux VI: gmc sw_init → ucode_create_bo → phase1 → fw_loading → phase2 gmc hw_init
+    # Linux: amdgpu_atom_asic_init before ip_init (SMC / mc_program / LoadUcodes)
     self.vi_common_init()
+    self.enable_vbios_rom()
+    from atom_replay import run_asic_init_if_needed
+    run_asic_init_if_needed(self)
     self.gmc_sw_init()
     self.start_smc()
     self.mc_program()

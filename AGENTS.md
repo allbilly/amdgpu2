@@ -20,3 +20,4 @@ ask deepwiki on github repo
 - geerlingguy/raspberry-pi-pcie-devices
 
 https://github.com/boopdotpng/tenstorrent-docs/blob/master/hardware/tinygrad-amd-dma-vs-blackhole-host-memory.md
+https://github.com/geerlingguy/raspberry-pi-pcie-devices/discussions/756
