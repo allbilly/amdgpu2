@@ -13,3 +13,10 @@ ask deepwiki on github repo
 - torvalds/linux
 - vosen/amdgpu_debug
 - vosen/ZLUDA
+- boopdotpng/tenstorrent-docs
+- boopdotpng/rdna-sim
+- acidanthera/VirtualSMC
+- Nihal2202/macOS-Tahoe-Ryzentosh
+- geerlingguy/raspberry-pi-pcie-devices
+
+https://github.com/boopdotpng/tenstorrent-docs/blob/master/hardware/tinygrad-amd-dma-vs-blackhole-host-memory.md
