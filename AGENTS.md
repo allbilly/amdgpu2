@@ -1,6 +1,7 @@
 linux code at ref/linux
 
 ask deepwiki on github repo
+- TheTom/pascal-egpu
 - kc9zda/atombios-inspect
 - Zile995/PinnacleRidge-Polaris-GPU-Passthrough
 - Aitbytes/proxmox-amd-gpu-passthrough

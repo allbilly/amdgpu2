@@ -2,7 +2,7 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-08
+**Last updated:** 2026-07-08 ~22:03 — APCIE panic #5; session stopped at `fw-mec`
 
 ## Status
 
@@ -10,10 +10,119 @@
 |------|--------|
 | **Solved** | ATOM `asic_init` — VRAM trains (`MEMSIZE=4096`, `MISC0\|0x80`, `trained=True`) |
 | **Solved** | Direct MMIO firmware upload path (bypasses SMC `LoadUcodes`) |
-| **Blocker** | `CP_HQD_ACTIVE=0` — KIQ/KCQ not activating; **SRBM field layout was wrong** (fixed in code, not yet verified on HW) |
-| **Danger** | **`--boot-stage=fw-direct` with full mask / MEC upload can kernel-panic macOS** — default is RLC-only now |
-| **Next** | `--boot-stage=fw-rlc` → `fw-cp` → `fw-mec` → `kiq` (no doorbell) → `kiq-map` |
-| **Safe** | `--probe`, `--selftest`, `--boot-stage=atom`, `--boot-stage=pre-fw`, `--boot-stage=fw-rlc` |
+| **Solved** | Staged fw upload: `atom` → `fw-mec` completes without panic (~32s total) |
+| **Solved** | SRBM / KCQ direct / GART PTE — verified in **earlier** sessions (not re-validated this reboot) |
+| **Blocker** | **CP rings never drain** — `PQ_RPTR=0x0`; `SCRATCH` stuck at `0xCAFEDEAD` (earlier `kcq-ring-test`) |
+| **Blocker** | **GPU-side GART DMA unproven** — CPU `pte_ok=True` ≠ device can read `0xff00…` sysmem |
+| **Fixed** | **macOS USB4 APCIE MSI panic** — device IRQs now masked (PCI MSI/INTx + GPU IH/CP interrupt block) before firmware runs; see *Fix: interrupt masking* below |
+| **Session #5** | **Crashed during `fw-start`→`gart-probe`→`kcq-direct` chain** — only `atom`+`fw-mec` completed (pre interrupt-mask fix) |
+| **Current stage** | Interrupt-mask fix landed — device IRQs masked before firmware runs; re-run staged boot to verify no panic |
+| **Next** | Replug → `fw-start` alone → `gart-probe` alone → `kcq-direct` alone → `AMD_BOOT_RING_TEST=1 kcq-ring-test` (panic trigger now removed) |
+| **Safe (this session)** | `--probe`, `--selftest`, `atom`, `fw-mec` (upload only, MEC stays halted) |
+| **Risky** | `fw-start` (unhalt MEC), `gart-probe`, `kcq-direct`, anything with ring dispatch |
+| **Gated** | `kiq-map`, `kcq-ring-test` (`AMD_BOOT_RING_TEST=1`), `add` (`AMD_BOOT_ADD=1`), `AMD_BOOT_FULL=1` |
+
+---
+
+## Current stage & blocker (2026-07-08 ~22:03)
+
+### Session #5 — panic during chained boot
+
+**This reboot, before crash:**
+
+| Step | Command | Result | Time |
+|------|---------|--------|------|
+| 1 | `--probe` | `pci=1002:67df` cold (`MEMSIZE=0`, MEC halted) | ~0.5s |
+| 2 | `--boot-stage=atom` | `trained=True` `MEMSIZE=0x1000` | ~2.8s |
+| 3 | `--boot-stage=fw-mec` | `CP_MEC_CNTL=0x50000000` (halted) | ~29s |
+| 4 | `fw-start && gart-probe && kcq-direct` | **macOS kernel panic** — no stage output captured | killed @141s |
+
+**Furthest safe point this session:** end of **`fw-mec`** — firmware uploaded, MEC still halted.
+
+```
+atom → fw-mec → fw-start → gart-probe → kcq-direct → kcq-ring-test → add
+ ✓       ✓        ?           ?              ?              ✗           ✗
+         ↑ YOU ARE HERE (MEC halted, fw resident)
+```
+
+### Fix: interrupt masking (2026-07-08 — panic root cause)
+
+The `apciec unhandled interrupts (0x200000)` panic was the eGPU **asserting an IRQ
+to the macOS USB4 bridge**, which TinyGPU.app leaves unhandled. Once CP/MEC/RLC
+firmware goes live it raises MSIs the `AppleT8103PCIe` bridge cannot route →
+kernel panic. Disabling the BAR2 doorbell (`AMD_BOOT_NO_DOORBELL=1`) only removed
+*one* MSI trigger; the firmware itself still asserted interrupts on unhalt.
+
+**Fix — mask every device interrupt source, keep the GPU polling-only:**
+
+| Layer | Where | What |
+|-------|-------|------|
+| PCI config | `RemotePCIDevice.mask_msi()` (`add.py`, called in `PolarisDevice.__init__`) | Set PCI command **Interrupt Disable** (bit 10); walk cap list, clear **MSI Enable** / **MSI-X Enable**. Bus-master (DMA) left on. |
+| GPU IH block | `PolarisBoot.disable_gpu_interrupts()` (`polaris_boot.py`) | `tonga_ih_disable_interrupts`: `IH_RB_CNTL` RB_ENABLE+ENABLE_INTR=0, zero RPTR/WPTR, IH doorbell off |
+| CP / compute pipe | same method | `CP_INT_CNTL_RING0=0`, `CPC_INT_CNTL=0` (no EOP/priv/error IRQ requests) |
+
+Wired into `vi_common_init` (baseline), and **before every unhalt**:
+`unhalt_loaded_firmware`, `load_ip_firmware_direct` (unhalt block), `enable_compute`.
+Enabled by default on darwin; toggle with `AMD_BOOT_MASK_INTERRUPTS=0/1`.
+
+### Remaining blocker
+
+#### A) Platform — APCIE MSI panic (FIXED, verify on HW)
+
+Prior signature:
+
+```
+apciec[pcic0-bridge] unhandled interrupts (0x200000 out of 0x220000)
+@APCIECPort.cpp:2056  (AppleT8103PCIeC / USB4)
+```
+
+| When it fired | Now handled by |
+|---------------|----------------|
+| `fw-start` (MEC unhalt) | `disable_gpu_interrupts("pre-unhalt")` before `cp_*_enable(True)` |
+| `kcq-direct` (`enable_compute` + HQD) | `disable_gpu_interrupts("pre-enable-compute")` + PCI MSI mask |
+| `kcq-ring-test` / doorbell | `AMD_BOOT_NO_DOORBELL=1` (darwin) + MSI enable cleared in config |
+| Chaining stages | Still avoid — settle rules below unchanged |
+
+**Rule (still advised):** one `python3 add.py --boot-stage=…` per shell invocation;
+wait 5–10s between steps after `fw-start`. The IRQ mask removes the panic trigger,
+but USB4 link settle timing is still worth respecting.
+
+#### B) Functional — rings never execute PM4 (earlier session, pre-#5)
+
+From last successful boot through `kcq-direct` (earlier tonight):
+
+| Stage | Result |
+|-------|--------|
+| `fw-start` | `CP_MEC_CNTL=0x10000000` |
+| `gart-probe` | `pte_ok=True` `pte=0x48077` |
+| `kcq-direct` | `KIQ=1` `KCQ=1` |
+| `kcq-ring-test` | `ring_ok=False` `SCRATCH=0xcafedead` `PQ_RPTR=0x0` → panic |
+
+HQD `ACTIVE=1` only means registers committed — **MEC never fetched the ring**. Until `SCRATCH=0xDEADBEEF`, vector-add is pointless.
+
+Likely causes (unchanged):
+
+1. GPU cannot DMA-read GART sysmem (`0xff00…` ring/MQD/wptr) despite CPU PTE self-test passing.
+2. Direct KCQ bypasses Linux `MAP_QUEUES` / `SET_RESOURCES` — scheduler may not know about the queue.
+3. TinyGPU `PrepareDMA` / M1 USB4 lacks device-coherent mapping for PTE table + buffers.
+
+### Mitigations already in code
+
+| Change | Status |
+|--------|--------|
+| `AMD_BOOT_NO_DOORBELL=1` (darwin default) | Skip BAR2 MSI path |
+| `boot_use_mmio_wptr()` | MMIO `CP_HQD_PQ_WPTR` when no doorbell |
+| `AMD_BOOT_RING_TEST=1` / `AMD_BOOT_ADD=1` gates | Block ring dispatch / vector-add |
+| `boot_minimal_for_compute()` + `enable_compute()` | Fixed on `skip_fw` path |
+
+**Not proven:** MMIO-only `kcq-ring-test` — panic #4/#5 prevented completion.
+
+### Open questions (priority)
+
+1. Does **`fw-start` alone** panic, or only when followed immediately by GART/HQD? (isolate unhalt vs compute setup)
+2. **SDMA GPU readback** from GART VA — only test that proves device DMA (not `gart-probe`)
+3. Can we **`fw-start` with MEC still halted** for compute queues? (probably not — need ME1 running)
+4. TinyGPU-side: mask GPU MSI at bridge before unhalt?
 
 ---
 
@@ -98,7 +207,7 @@ Even with `trained=True`, CPU cannot read/write VRAM:
 
 **Workaround:** GART sysmem for compute buffers + **direct MMIO** firmware upload (no SMC DMA).
 
-### 2026-07-08 evening — direct MMIO + KIQ/KCQ port (in progress)
+### 2026-07-08 evening — direct MMIO + KIQ/KCQ port 
 
 **Done in code** (`ref/linux`):
 
@@ -107,10 +216,28 @@ Even with `trained=True`, CPU cannot read/write VRAM:
 - KIQ at `me=1, pipe=1, queue=0` (KCQ uses `pipe=0`) per `amdgpu_gfx_kiq_acquire`
 - **SRBM bug fixed:** `srbm_select` had wrong `SRBM_GFX_CNTL` field layout (`vi.c` uses pipe@0, me@2, vmid@4, queue@8 — we had them scrambled)
 
-**Last HW session before macOS kernel panic:**
+**Last HW session (2026-07-08 late PM) — staged boot without panic:**
 
-- `CP_MEC_CNTL=0` (MEC unhalted) but `CP_HQD_ACTIVE=0` for both KIQ and KCQ
-- Likely cause: wrong SRBM routing (now fixed in code, **not yet verified**)
+| Stage | Result | Notes |
+|-------|--------|-------|
+| `fw-mec` | ✓ ~32s | `CP_MEC_CNTL=0x50000000` (halted) |
+| `fw-start` | ✓ ~4s | `CP_MEC_CNTL=0x10000000` (ME1 only) |
+| `kiq` | ✓ ~33s | `KIQ_HQD_ACTIVE=0x1`, `KCQ=0x0` (expected) |
+| `kiq-map` | ✓ ~6s **no crash** | `skip_fw=True`; `KCQ_HQD_ACTIVE` still `0x0` |
+| `AMD_BOOT_FULL=1` | ✗ no panic | `result=[0,0,0,0]` — KCQ never activated |
+
+**Observed after `kiq-map` doorbell (`DEBUG=1`):**
+
+```
+KIQ_HQD_ACTIVE=0x1
+KIQ PQ_WPTR=0x100   (256 dwords — ring commit + doorbell accepted)
+KIQ PQ_RPTR=0x0     (MEC never consumed KIQ ring)
+CP_HQD_ERROR=0x0
+KCQ_HQD_ACTIVE=0x0
+GART: 0xff00000000–0xff0fffffff, kcq_mqd=0xff00110000
+```
+
+**Interpretation:** MAP_QUEUES PM4 is in the ring and the doorbell updates WPTR, but **KIQ firmware does not advance RPTR**. Likely causes: (1) GPU cannot read GART-backed sysmem ring/MQD, (2) MEC/KIQ scheduler not fetching, (3) need TrustOS direct-HQD path instead of KIQ.
 
 **Crash post-mortem (2026-07-08 PM #1):** wrong `srbm_select` + KIQ doorbell → kernel panic.
 
@@ -123,7 +250,32 @@ Even with `trained=True`, CPU cannot read/write VRAM:
 | Wrong MEC doorbell range upper | `DOORBELL_MEC_RING7=0x17` not `MEC_RING0+8` |
 | Duplicate `enable_compute` | Removed from `_boot_stage_kiq` when using full fw path |
 
-Linux VI path: `gfx_v7_0_cp_gfx_load_microcode` (PFP/CE/ME, halt via `CP_ME_CNTL`), `gfx_v7_0_cp_compute_load_microcode` (MEC), `cik_sdma_load_microcode` (SDMA halt first). SMC `LoadUcodes` still preferred when BAR0 works — splits MEC JT as separate TOC entries (`amdgpu_cgs.c`).
+**Fixes (2026-07-08 late PM — DeepWiki + `ref/linux` audit):**
+
+| Issue | Fix |
+|-------|-----|
+| KIQ ring commit alignment | `VI_RING_ALIGN_MASK=0xff` (256-dword pad per `gfx_v8_0_ring_funcs_kiq`) |
+| Missing wptr CPU shadow | `_publish_wptr()` before doorbell (`gfx_v8_0_ring_set_wptr_compute`) |
+| MQD `rptr_report` used `wptr_gpu` | Separate `rptr_gpu` / `wptr_gpu` in `ComputeQueue.init()` |
+| `skip_fw` GART at wrong VA | `boot_minimal_for_compute()` calls **`gmc_sw_init()`** before `gart_enable()` |
+| GART PTE in VRAM when BAR0 writes probe ok | **`boot_minimal` forces `AMD_BOOT_GART_SYSMEM=1`** (host PTE table) |
+| `vi_common_init` on hot GPU | Removed from `boot_minimal` (avoid golden-reg reset mid-session) |
+| RLC safe mode | `rlc_exit_safe_mode()` before `kiq_setting` (TrustOS / `gfx_v8_0_unset_safe_mode`) |
+| PM4 ring padding | `VI_PKT3_NOP` (`PACKET3_NOP, 0x3FFF`) not `PACKET2(0)` |
+| Doorbell BAR2 index | `ring_doorbell(index)` uses **`index >> 2`** (VI byte offset → dword slot) |
+| Compute buffers on GART | `ComputeQueue._gtt` when `gart_pte_sysmem` is set |
+
+**Fixes (2026-07-08 evening — DeepWiki tier-1 repos + code audit):**
+
+| Issue | Fix |
+|-------|-----|
+| GART PTE table not flushed to device | `_gart_pte_flush()` after PTE build + every `map_sysmem_gpu()` |
+| Wrong doorbell enable | Removed `CP_PQ_STATUS | (1<<28)`; use `set_mec_doorbell_range()` only (bit 1) |
+| No GART validation before KIQ | `probe_gart_dma()` + `--boot-stage=gart-probe` |
+| KCQ stuck after MAP_QUEUES | `AMD_BOOT_KCQ_DIRECT=1`, `--boot-stage=kcq-direct`, auto-fallback in `setup_with_kiq` |
+| HDP before TLB invalidate | `hdp_flush()` in `map_sysmem_gpu()` after PTE writes |
+
+Linux VI path: `gfx_v7_0_cp_gfx_load_microcode` (PFP/CE/ME), `gfx_v7_0_cp_compute_load_microcode` (MEC), `cik_sdma_load_microcode` (SDMA). KCQ resume: `gfx_v8_0_kcq_init_queue` (MQD only) → `set_mec_doorbell_range` → `gfx_v8_0_kiq_kcq_enable` → `amdgpu_ring_commit`.
 
 ### Staged verification plan (do NOT skip steps)
 
@@ -143,17 +295,23 @@ python3 add.py --boot-stage=fw-cp
 # 5. + MEC upload only — stay halted (~15s with settle pauses)
 AMD_MMIO_DRAIN_EVERY=32 python3 add.py --boot-stage=fw-mec
 
-# 6. Settle + unhalt ME1 (separate step — if crash, it was upload not unhalt)
+# 6. Settle + unhalt ME1 — RUN ALONE, wait 10s before next step
 python3 add.py --boot-stage=fw-start
+sleep 10
 
-# 7. KIQ MQD only — no doorbell
-python3 add.py --boot-stage=kiq
+# 7. GART PTE self-map — RUN ALONE
+python3 add.py --boot-stage=gart-probe
 
-# 7. KIQ + MAP_QUEUES doorbell
-AMD_BOOT_KIQ_MAP=1 python3 add.py --boot-stage=kiq-map
+# 8. KCQ direct HQD — RUN ALONE
+python3 add.py --boot-stage=kcq-direct
 
-# 8. Full vector-add
-AMD_BOOT_FULL=1 python3 add.py
+# 9. KCQ ring test — gated; MMIO wptr only on darwin
+AMD_BOOT_RING_TEST=1 python3 add.py --boot-stage=kcq-ring-test
+
+# 10. Vector-add — only after ring_ok=True
+AMD_BOOT_ADD=1 python3 add.py --boot-stage=add
+
+# DO NOT chain: fw-start && gart-probe && kcq-direct  (caused panic #5)
 ```
 
 ---
@@ -166,14 +324,22 @@ Layer 1 ATOM `asic_init` was stuck due to two `atom_replay.py` interpreter bugs 
 
 ## ⚠️ STOP — Safety
 
-**Repeated crashes** — USB4 drop (replug) or **full macOS kernel panic** (reboot).
+**Interrupt-mask fix (above) removes the APCIE MSI panic trigger** — the device no
+longer asserts IRQs to the USB4 bridge. Firmware unhalt / compute setup should no
+longer kernel-panic. Residual risk is USB4 link drop (replug), not full reboot.
+Still run one stage per shell and respect settle timing until verified on HW.
 
 | Command | Safe? |
 |---------|-------|
 | `--probe`, `--selftest` | ✅ |
 | `--boot-stage=atom`, `--boot-stage=pre-fw` | ⚠️ low–medium |
 | `--boot-stage=fw-direct` | ⚠️ high MMIO volume |
-| `--boot-stage=kiq` | ⚠️ high |
+| `--boot-stage=fw-mec` | ⚠️ medium | ~30s MMIO; MEC stays halted — **safe endpoint this session** |
+| `--boot-stage=fw-start` | ⚠️ **high** | MEC unhalt — may trigger APCIE MSI (panic #5 suspect) |
+| `--boot-stage=gart-probe` | ⚠️ medium | GART PTE setup |
+| `--boot-stage=kcq-direct` | ⚠️ **high** | KIQ+KCQ HQD commit |
+| `--boot-stage=kcq-ring-test` | ❌ **gated** — `AMD_BOOT_RING_TEST=1`; caused APCIE panic with doorbell |
+| `--boot-stage=add` | ❌ **gated** — `AMD_BOOT_ADD=1` |
 | **`add.py` default** | ❌ **blocked** — requires `AMD_BOOT_FULL=1` |
 | `AMD_BOOT_LOADUCODES_UNTRAINED=1` | ❌ never |
 
@@ -250,11 +416,16 @@ Default `add.py` now: ATOM train → SMC boot → **skip LoadUcodes** → comput
 
 ## Next steps (ordered)
 
-1. **GART-sysmem DMA probe** — map one `alloc_sysmem` page into GART; single SDMA/engine read; PCI health check; abort on `0xffff`. Do **not** run full LoadUcodes first.
-2. **Direct MMIO firmware load** — port TrustOS `polaris_sdma_full_init` style upload (RLC/MEC via registers, bypass `PPSMC_MSG_LoadUcodes`) once step 1 works.
-3. **Compute** — only after firmware is resident.
+1. **Replug eGPU** — `--probe` must show `pci=1002:67df`.
+2. **`atom`** then **`fw-mec`** — confirmed safe this session (~32s total).
+3. **`fw-start` alone** — wait 10s; note if panic happens here (isolates MEC unhalt).
+4. **`gart-probe` alone** — CPU PTE check only.
+5. **`kcq-direct` alone** — HQD commit; expect `KCQ=1`.
+6. **`AMD_BOOT_RING_TEST=1 kcq-ring-test`** — only if step 5 survives; watch `SCRATCH`.
+7. If ring stuck → **SDMA GPU readback** from GART VA before any more dispatch attempts.
+8. **Never chain stages** in one shell command on USB4.
 
-Open question: can SMC DMA to trained VRAM MC addresses even though CPU BAR0 is dead? Probe step 1 answers the GART/sysmem side.
+Open question: panic #5 hit during chained `fw-start→gart→kcq` — is **`fw-start` unhalt** the trigger, or **`kcq-direct` HQD setup**?
 
 ---
 
@@ -315,6 +486,10 @@ vi_common_init → enable_vbios_rom → ATOM asic_init
 - [x] VBIOS ROM read (`0xe974aa55`)
 - [x] Golden regs + doorbells (`vi_common_init`)
 - [x] LoadUcodes safety gates (skip when BAR0/MM dead)
+- [x] Staged direct MMIO fw: `fw-mec`, `fw-start` (ME1 unhalt, no panic)
+- [x] KIQ MQD commit → `KIQ_HQD_ACTIVE=0x1` (SRBM fix verified)
+- [x] `kiq-map` with `skip_fw` — fast, no kernel panic (KCQ still inactive)
+- [x] GART PTE flush + `gart-probe` + KCQ direct fallback (code; HW pending)
 - [x] MMIO drain (`AMD_MMIO_DRAIN_EVERY`)
 
 ## Todo
@@ -329,7 +504,7 @@ vi_common_init → enable_vbios_rom → ATOM asic_init
 
 ## References — DeepWiki re-rank (2026-07-08, latest)
 
-Scored **0–10** for the **current** blocker: trained VRAM, dead BAR0/MM_INDEX, GART-sysmem DMA probe, direct MMIO fw upload, avoid macOS kernel panic. **Not** ATOM training (solved). DeepWiki MCP + code review (`examples_egpu/add.py` lineage).
+Scored **0–10** for the **current** blocker: **KIQ ring not draining / KCQ not activating** on GART-sysmem; need GART DMA proof or TrustOS direct-HQD fallback. DeepWiki + `ref/linux` `gfx_v8_0.c` audit (2026-07-08 late PM).
 
 ### `tinygrad/tinygrad` review (DeepWiki 2026-07-08)
 
@@ -446,6 +621,16 @@ python3 diag_bar0.py                    # BAR0 diagnosis
 | `AMD_MMIO_SETTLE_ROUNDS` | `30` | heavy settle loops before unhalt |
 | `AMD_MMIO_SETTLE_MS` | `100` | ms per settle round |
 | `AMD_BOOT_MEC2_HALT` | `1` | keep MEC2 halted (ME1 only) |
+| `AMD_BOOT_KIQ_MAP` | `0` | `1` = allow `--boot-stage=kiq-map` MAP_QUEUES doorbell |
+| `AMD_BOOT_KCQ_DIRECT` | `auto` | `1` = force direct KCQ HQD; `auto` = fallback after MAP_QUEUES fails |
+| `AMD_BOOT_NO_DOORBELL` | `1` on darwin | `1` = skip BAR2 doorbell (prevents APCIE MSI panic) |
+| `AMD_BOOT_MASK_INTERRUPTS` | `1` on darwin | `1` = mask PCI MSI/INTx + GPU IH/CP interrupts (prevents APCIE panic on unhalt) |
+| `AMD_BOOT_MMIO_WPTR` | auto | `1` when `NO_DOORBELL`; MMIO `CP_HQD_PQ_WPTR` (TrustOS path) |
+| `AMD_BOOT_RING_TEST` | `0` | `1` = allow `--boot-stage=kcq-ring-test` |
+| `AMD_BOOT_ADD` | `0` | `1` = allow `--boot-stage=add` |
+| `AMD_BOOT_GART_SYSMEM` | `auto` | `1` = host PTE table (forced in `boot_minimal_for_compute`) |
+| `AMD_BOOT_KCQ_ACTIVE_TIMEOUT_S` | `5` | poll for KCQ active after MAP_QUEUES |
+| `AMD_BOOT_DOORBELL_SETTLE_MS` | `10`/`50` | sleep after wptr signal (10 when no doorbell) |
 | `AMD_BOOT_VBIOS_FILE` | — | Path to `rx570.rom` |
 | `AMD_ATOM_JUMP_BAIL` | `0` | `1` = fake-complete ATOM (obsolete now) |
 | `DEBUG` | `0` | Verbose logging |

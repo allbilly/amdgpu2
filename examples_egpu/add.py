@@ -225,6 +225,43 @@ class RemotePCIDevice:
   def write_config(self, offset: int, size: int, val: int):
     self._rpc(self.sock, self.dev_id, RemoteCmd.CFG_WRITE, offset, size, val)
 
+  def mask_msi(self) -> list[str]:
+    """Stop the eGPU from asserting IRQs to the macOS USB4 bridge.
+
+    Root cause of the recurring `apciec unhandled interrupts (0x200000)` kernel
+    panic: TinyGPU.app passes raw MMIO/BAR but installs no interrupt handler, so
+    once CP/MEC firmware runs the GPU sends MSIs the AppleT8103PCIe bridge cannot
+    route. We keep the device polling-only: disable legacy INTx (PCI command bit
+    10) and clear the MSI/MSI-X enable bits in config space. Bus-master (DMA for
+    GART sysmem) is left untouched."""
+    cleared: list[str] = []
+    with contextlib.suppress(Exception):
+      cmd = self.read_config(0x04, 2)
+      if not (cmd & (1 << 10)):
+        self.write_config(0x04, 2, (cmd | (1 << 10)) & 0xffff)
+      cleared.append("intx")
+    with contextlib.suppress(Exception):
+      status = self.read_config(0x06, 2)
+      if not (status & (1 << 4)):
+        return cleared  # no PCI capability list
+      cap = self.read_config(0x34, 1) & 0xfc
+      seen = 0
+      while cap and cap != 0xfc and seen < 48:
+        seen += 1
+        cap_id = self.read_config(cap, 1) & 0xff
+        nxt = self.read_config(cap + 1, 1) & 0xfc
+        if cap_id == 0x05:  # MSI capability — clear MSI Enable (bit 0 of Message Control)
+          mc = self.read_config(cap + 2, 2)
+          if mc & 0x1:
+            self.write_config(cap + 2, 2, mc & ~0x1)
+          cleared.append(f"msi@{cap:#x}")
+        elif cap_id == 0x11:  # MSI-X — clear MSI-X Enable (bit 15), set Function Mask (bit 14)
+          mc = self.read_config(cap + 2, 2)
+          self.write_config(cap + 2, 2, (mc & ~(1 << 15)) | (1 << 14))
+          cleared.append(f"msix@{cap:#x}")
+        cap = nxt
+    return cleared
+
   def amd_cfg_reset(self):
     """Linux vi_asic_pci_config_reset: write AMDGPU_ASIC_RESET_DATA to cfg 0x7c."""
     self.write_config(AMDGPU_ASIC_RESET_CFG_OFF, 4, AMDGPU_ASIC_RESET_DATA)
@@ -439,6 +476,13 @@ class PolarisDevice:
     self.doorbell = self.pci.map_bar(2, fmt='I')  # VI doorbells are 32-bit byte-indexed
     self.mmio = self.pci.map_bar(5, fmt='I') # register aperture
     self.bar0_size = self.pci.bar_info(0)[1]
+    # macOS USB4 has no handler for eGPU IRQs → mask MSI/INTx before any firmware runs
+    # (prevents the recurring APCIE 'unhandled interrupts' kernel panic).
+    if OSX and getenv("AMD_BOOT_MASK_INTERRUPTS", 1):
+      with contextlib.suppress(Exception):
+        masked = self.pci.mask_msi()
+        if DEBUG >= 1:
+          print(f"polaris: masked device interrupts {masked}", flush=True)
     self._vram_off = 0x100000  # bump allocator in VRAM window
     self._boot: object | None = None
     self._vram_start = 0
@@ -565,8 +609,13 @@ class PolarisDevice:
     return bar_off
 
   def ring_doorbell(self, index: int, wptr: int):
+    # VI amdgpu_mm_wdoorbell(index) uses byte offset; BAR2 mmap is dword-indexed.
+    from polaris_boot import boot_no_doorbell
+    if boot_no_doorbell():
+      return
+    slot = index >> 2
     self.pci.drain_mmio(bar=5, reg=REG_GRBM_STATUS)
-    self.doorbell[index] = wptr & 0xffffffff
+    self.doorbell[slot] = wptr & 0xffffffff
     self.pci.drain_mmio(bar=5, reg=REG_GRBM_STATUS)
 
   def alloc_vram(self, size: int, align=0x1000) -> int:
@@ -638,10 +687,10 @@ class PolarisDevice:
     cq = ComputeQueue(b, me=1, pipe=0, queue=0, doorbell_index=DOORBELL_MEC_RING0)
     cq.init()
     cq.setup_with_kiq(map_queues=map_queues)
-    if map_queues:
-      b._compute = cq
     kiq_active = b.read_hqd_active(KIQ_ME, KIQ_PIPE, KIQ_QUEUE)
     kcq_active = b.read_hqd_active(1, 0, 0)
+    if kcq_active & 1:
+      b._compute = cq
     print(f"stage=kiq map_queues={map_queues} skip_fw={skip_fw} "
           f"CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} "
           f"KIQ_HQD_ACTIVE={kiq_active:#x} KCQ_HQD_ACTIVE={kcq_active:#x}")
@@ -723,17 +772,62 @@ class PolarisDevice:
         print("BLOCKED: kiq-map requires AMD_BOOT_KIQ_MAP=1", file=sys.stderr)
         sys.exit(2)
       self._boot_stage_kiq(b, map_queues=True, skip_fw=True); return
+    if stage == "gart-probe":
+      b.probe_gart_dma()
+      print("stage=gart-probe ok"); return
+    if stage == "kcq-direct":
+      os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
+      self._boot_stage_kiq(b, map_queues=False, skip_fw=True); return
+    if stage == "kcq-ring-test":
+      if os.environ.get("AMD_BOOT_RING_TEST", "0") != "1":
+        print("GATED: kcq-ring-test — APCIE MSI panic trigger now masked "
+              "(AMD_BOOT_MASK_INTERRUPTS=1 default on darwin).", file=sys.stderr)
+        print("  Run:   AMD_BOOT_RING_TEST=1 python3 add.py --boot-stage=kcq-ring-test", file=sys.stderr)
+        print("  (uses MMIO PQ_WPTR only; NO BAR2 doorbell on darwin by default)", file=sys.stderr)
+        sys.exit(2)
+      from polaris_boot import mmSCRATCH_REG0, mmCP_HQD_PQ_WPTR, mmCP_HQD_PQ_RPTR, boot_no_doorbell
+      os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
+      self._boot_stage_kiq(b, map_queues=False, skip_fw=True)
+      cq = b._compute
+      if cq is None:
+        print("stage=kcq-ring-test BLOCKED: KCQ not active", file=sys.stderr)
+        sys.exit(2)
+      ok = cq.ring_test_scratch()
+      scratch = b.rreg(mmSCRATCH_REG0)
+      b.srbm_select(1, 0, 0, 0)
+      rptr = b.rreg(mmCP_HQD_PQ_RPTR)
+      wptr = b.rreg(mmCP_HQD_PQ_WPTR)
+      b.srbm_select(0, 0, 0, 0)
+      print(f"stage=kcq-ring-test ring_ok={ok} SCRATCH={scratch:#x} "
+            f"PQ_WPTR={wptr:#x} PQ_RPTR={rptr:#x} no_doorbell={boot_no_doorbell()}")
+      return
+    if stage == "kiq-nop":
+      os.environ["AMD_BOOT_KIQ_NOP_TEST"] = "1"
+      self._boot_stage_kiq(b, map_queues=False, skip_fw=True); return
+    if stage == "add":
+      if os.environ.get("AMD_BOOT_ADD", "0") != "1":
+        print("BLOCKED: --boot-stage=add can kernel-panic macOS (KCQ dispatch).", file=sys.stderr)
+        print("  Safe first: python3 add.py --boot-stage=kcq-ring-test", file=sys.stderr)
+        print("  Then:       AMD_BOOT_ADD=1 python3 add.py --boot-stage=add", file=sys.stderr)
+        sys.exit(2)
+      os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
+      self._boot_stage_kiq(b, map_queues=False, skip_fw=True)
+      result = self.run_add()
+      print(f"stage=add result={result}"); return
     b.boot()
     self._vram_start = b.vram_start
 
   def submit_compute_ib(self, ib_words: list[int]) -> None:
     if self._boot is None:
       self.boot()
-    cq = self._boot.init_compute_queue()
+    if self._boot._compute is None:
+      self._boot.init_compute_queue()
+    cq = self._boot._compute
     cq.submit_ib(ib_words)
 
   def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b_vals=(10.0, 20.0, 30.0, 40.0)):
-    self.boot()
+    if self._boot is None:
+      self.boot()
     boot = self._boot
     use_gtt = not boot.probe_bar0_writes()
 
@@ -801,8 +895,17 @@ def selftest():
   assert len(ADD_SHADER) == 140
   assert len(ib) >= 20
   assert ib[0] >> 30 == PKT_TYPE3
+  from polaris_boot import (PACKET3_SET_RESOURCES, PACKET3_MAP_QUEUES, pkt3,
+                            _map_queues_num_q, _map_queues_dbell, _map_queues_queue,
+                            _map_queues_pipe, _map_queues_me, DOORBELL_MEC_RING0)
+  set_pkt = [pkt3(PACKET3_SET_RESOURCES, 6), 0, 1, 0, 0, 0, 0, 0]
+  me_bit = (_map_queues_dbell(DOORBELL_MEC_RING0) | _map_queues_queue(0)
+            | _map_queues_pipe(0) | _map_queues_me(0))
+  map_pkt = [pkt3(PACKET3_MAP_QUEUES, 5), _map_queues_num_q(1), me_bit,
+             0xff00110000, 0xff, 0xff00120040, 0xff]
+  assert len(set_pkt) == 8 and len(map_pkt) == 7
   sha = hashlib.sha256(ADD_SHADER).hexdigest()[:12]
-  print(f"middle_selftest=ok shader_sha={sha} ib_words={len(ib)}")
+  print(f"middle_selftest=ok shader_sha={sha} ib_words={len(ib)} kiq_pkt_words={len(set_pkt)+len(map_pkt)}")
 
 def reset_gpu(mode: str = "auto"):
   if mode != "auto":
@@ -849,8 +952,10 @@ def main():
   if os.environ.get("AMD_BOOT_FULL") != "1":
     print("BLOCKED: full boot can kernel-panic macOS over USB4.", file=sys.stderr)
     print("  Safe:  python3 add.py --probe | --selftest | --boot-stage=atom | --boot-stage=pre-fw", file=sys.stderr)
-    print("  Stage: python3 add.py --boot-stage=fw-rlc | fw-cp | fw-mec | fw-direct", file=sys.stderr)
-    print("  Full:  AMD_BOOT_FULL=1 python3 add.py   (only after --boot-stage=kiq shows KIQ_HQD_ACTIVE!=0)", file=sys.stderr)
+    print("  Stage: python3 add.py --boot-stage=fw-rlc | fw-cp | fw-mec | --boot-stage=gart-probe", file=sys.stderr)
+    print("         python3 add.py --boot-stage=kcq-direct | kcq-ring-test", file=sys.stderr)
+    print("  Add:   AMD_BOOT_ADD=1 python3 add.py --boot-stage=add", file=sys.stderr)
+    print("  Full:  AMD_BOOT_FULL=1 python3 add.py   (only after kcq-ring-test passes)", file=sys.stderr)
     sys.exit(2)
   t0 = time.perf_counter()
   dev = PolarisDevice()
