@@ -232,6 +232,23 @@ Scored **0–10** for the **current** blocker: trained VRAM, dead BAR0/MM_INDEX,
 
 DeepWiki rated **2/10** for Polaris bring-up (correct for `AMDev`/`ops_amd`; underrates transport). **Adjusted: 7/10** — authoritative upstream for the same TinyGPU stack nvgpu and `examples_egpu/add.py` use; ignore `AMDev` for RX570.
 
+### `GatoAmarilloBicolor/AMDstracted-GPU` review (DeepWiki 2026-07-08)
+
+**Useful as modular VI/Polaris reference — not M1/TinyGPU transport.**
+
+| Layer | AMDstracted-GPU path | RX570 / M1 TinyGPU? |
+|-------|----------------------|---------------------|
+| **Architecture** | HAL + IP-block lifecycle (`early_init` → `hw_init`); `OBJGPU` with `mmio_base`, `ip_blocks[]` | **Reference** — mirrors linux VI ordering |
+| **Polaris VI** | `gmc_v8_0.c`, `gfx_v8_0.c` (`CHIP_POLARIS10/11/12`), `vi.c` + SDMA v2.4/v3.0 | **Yes** — gfx803/GCN3 blocks present |
+| **GART / MC** | `gmc_v8_0_mc_program`, `gmc_v8_0_polaris_mc_load_microcode`, TLB flush | **Yes** — same regs as linux `gmc_v8_0.c` |
+| **Firmware** | `polaris10_mc/rlc/mec/mec2/smc.bin` via `gfx_v8_0_init_microcode`, `amdgpu_cgs.c` | **Yes** — same bins; no TrustOS-style MMIO bypass |
+| **ATOM** | `amdgpu_atombios.h` / `atom.h` in VI path | **Partial** — uses kernel ATOM, not bare `atom_replay.py` |
+| **Command rings** | `amdgpu_command_submit_hal`, doorbells, GFX/compute/SDMA rings | **Post-fw** — needs working memory path first |
+| **Platform** | Linux DRM ioctl (`DRM_IOCTL_AMDGPU_CS`); Haiku/FreeBSD direct MMIO; sim fallback | **No macOS, Apple Silicon, TinyGPU, or USB4** |
+| **Tests** | 11/11 pass (mostly hardware simulation per DW) | Not validated on RX570 eGPU |
+
+DeepWiki rated **7–10** (generic cross-platform amdgpu bring-up; claims “production-ready” HAL). **Adjusted: 6/10** — cleaner IP-block navigation than spelunking full `torvalds/linux`, and confirms our `polaris_boot.py` ordering (GMC → GART → SMC → gfx fw). Does **not** solve BAR0-dead, GART-sysmem DMA on TinyGPU, or macOS panic gates; linux amdgpu remains canonical and this repo is derivative.
+
 ### Full ranking
 
 | Rank | Score | Repo | Verdict |
@@ -243,29 +260,31 @@ DeepWiki rated **2/10** for Polaris bring-up (correct for `AMDev`/`ops_amd`; und
 | 5 | **8** | **allbilly/nvgpu** | **Applied TinyGPU template** — working NV bare-metal on M1: `examples/add.py`, `middle_nv.py`, probe/selftest, sysmem DMA. `examples_egpu/add.py` mirrors this. DW: 2 (NV-only). |
 | 6 | **7** | **tinygrad/tinygrad** | **Upstream transport** — `APLRemotePCIDevice`, `MAP_BAR`, `MAP_SYSMEM_FD`, PrepareDMA, `setup_tinygpu_osx.sh`. **Do not use** `AMDev`/`ops_amd` for gfx803. DW: 2 → **7** for transport. |
 | 7 | **7** | **geerlingguy/raspberry-pi-pcie-devices** | [#756](https://github.com/geerlingguy/raspberry-pi-pcie-devices/discussions/756) ARM DMA coherency → `sysmem_dma_flush`. DW: 0. |
-| 8 | **5** | **komen205/polaris30-smu-bist** | `1002:67DF` UEFI SMU7 BIST after DMA works. DW: 10 — overrated; x86 only. |
-| 9 | **4** | **allbilly/AArch64-Explore-GPU** | AArch64 / Apple-Silicon GPU bring-up notes. |
-| 10 | **4** | **xCuri0/ReBarUEFI** | BAR sizing theory; PC UEFI only. DW: 9 — overrated for M1. |
-| 11 | **4** | **Aitbytes/proxmox-amd-gpu-passthrough** | `67DF` reset / Code 43 symptom parallel. DW: 10 — overrated. |
-| 12 | **3** | **allbilly/mesa-mesa** | Mesa/radeonsi reference post-fw. |
-| 13 | **3** | **tinygrad/7900xtx** | `polaris10_mec.bin` PM4 notes — after fw loads. |
-| 14 | **3** | **boopdotpng/tenstorrent-docs** | Host-memory DMA model contrast. |
-| 15 | **2** | **kc9zda/atombios-inspect** | Offline ROM audit (training solved). |
-| 16 | **2** | **ChefKissInc/NootedRed** | `ATOMBIOS.hpp` ported; Vega iGPU kext. |
-| 17 | **2** | **allbilly/miaow** | GCN Southern Islands RTL sim (gfx803-adjacent). |
-| 18 | **2** | **vosen/amdgpu_debug** | Post-boot rocgdb only. |
-| 19 | **1** | **Zile995/…** / **heavyarms2112/atitool** / **Andybf/AtomBiosEditor** | VFIO / Linux-only / offline editor. |
-| 20 | **1** | **gem5** / **mgpusim** / **gpgpu-sim** / **miaow (VRG)** / **rdna-sim** | Simulators. |
-| 21 | **0** | **NootRX** / **WhateverGreen** / **VirtualSMC** / **Hackintosh** / **ZLUDA** / **coreboot** | Wrong layer. |
-| 22 | **0** | **allbilly/applegpu** / **amd_scheduler** / **ml_workload** / **allbilly/tinygrad** fork | Other stacks (forks duplicate upstream tinygrad). |
+| 8 | **6** | **GatoAmarilloBicolor/AMDstracted-GPU** | HAL + `gmc_v8_0`/`gfx_v8_0` Polaris VI ref; GART + polaris10 fw bins. No macOS/TinyGPU. DW: 7–10 → **6**. |
+| 9 | **5** | **komen205/polaris30-smu-bist** | `1002:67DF` UEFI SMU7 BIST after DMA works. DW: 10 — overrated; x86 only. |
+| 10 | **4** | **allbilly/AArch64-Explore-GPU** | AArch64 / Apple-Silicon GPU bring-up notes. |
+| 11 | **4** | **xCuri0/ReBarUEFI** | BAR sizing theory; PC UEFI only. DW: 9 — overrated for M1. |
+| 12 | **4** | **Aitbytes/proxmox-amd-gpu-passthrough** | `67DF` reset / Code 43 symptom parallel. DW: 10 — overrated. |
+| 13 | **3** | **allbilly/mesa-mesa** | Mesa/radeonsi reference post-fw. |
+| 14 | **3** | **tinygrad/7900xtx** | `polaris10_mec.bin` PM4 notes — after fw loads. |
+| 15 | **3** | **boopdotpng/tenstorrent-docs** | Host-memory DMA model contrast. |
+| 16 | **2** | **kc9zda/atombios-inspect** | Offline ROM audit (training solved). |
+| 17 | **2** | **ChefKissInc/NootedRed** | `ATOMBIOS.hpp` ported; Vega iGPU kext. |
+| 18 | **2** | **allbilly/miaow** | GCN Southern Islands RTL sim (gfx803-adjacent). |
+| 19 | **2** | **vosen/amdgpu_debug** | Post-boot rocgdb only. |
+| 20 | **1** | **Zile995/…** / **heavyarms2112/atitool** / **Andybf/AtomBiosEditor** | VFIO / Linux-only / offline editor. |
+| 21 | **1** | **gem5** / **mgpusim** / **gpgpu-sim** / **miaow (VRG)** / **rdna-sim** | Simulators. |
+| 22 | **0** | **NootRX** / **WhateverGreen** / **VirtualSMC** / **Hackintosh** / **ZLUDA** / **coreboot** | Wrong layer. |
+| 23 | **0** | **allbilly/applegpu** / **amd_scheduler** / **ml_workload** / **allbilly/tinygrad** fork | Other stacks (forks duplicate upstream tinygrad). |
 
-**Takeaway:** Tier-1 AMD = **linux + this repo + TrustOS `firmware.rs`**. Tier-1b transport = **`nvgpu` (working example) + `tinygrad/tinygrad` (upstream `APLRemotePCIDevice` / TinyGPU.app)**. Tier-2 DMA = **rpi-pcie #756**. Chain: `tinygrad/system.py` → `nvgpu/add.py` → `examples_egpu/add.py` → `polaris_boot.py` (linux VI boot, not `AMDev`).
+**Takeaway:** Tier-1 AMD = **linux + this repo + TrustOS `firmware.rs`**. Tier-1b transport = **`nvgpu` (working example) + `tinygrad/tinygrad` (upstream `APLRemotePCIDevice` / TinyGPU.app)**. Tier-2 VI reference = **AMDstracted-GPU** (`gmc_v8_0.c`, `gfx_v8_0.c` — optional cleaner read vs full linux tree). Tier-2 DMA = **rpi-pcie #756**. Chain: `tinygrad/system.py` → `nvgpu/add.py` → `examples_egpu/add.py` → `polaris_boot.py` (linux VI boot, not `AMDev`).
 
 ### Primary files to read
 
 | Source | Path | Use for |
 |--------|------|---------|
 | Linux VI boot | `torvalds/linux` → `gmc_v8_0.c`, `atom.c`, `polaris10_smumgr.c` | GART, LoadUcodes, MM_INDEX fallback |
+| VI HAL ref (optional) | `GatoAmarilloBicolor/AMDstracted-GPU` → `gmc_v8_0.c`, `gfx_v8_0.c`, `vi.c` | IP-block lifecycle, polaris10 fw load order |
 | TrustOS fw | `nathan237/TrustOS` → `kernel/.../firmware.rs` | Direct MMIO upload, GMC golden regs |
 | nvgpu (applied) | `allbilly/nvgpu` → `examples/add.py`, `TODO.md` | Bare-metal eGPU pattern on TinyGPU |
 | **tinygrad (upstream)** | `tinygrad/tinygrad` → `runtime/support/system.py`, `extra/setup_tinygpu_osx.sh` | `APLRemotePCIDevice`, BAR/sysmem RPC, TinyGPU install |
