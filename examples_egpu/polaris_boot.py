@@ -26,6 +26,19 @@ def boot_use_mmio_wptr() -> bool:
     return False
   return boot_no_doorbell()
 
+
+def boot_allow_hqd_activation() -> bool:
+  """Whether it is safe to make a compute HQD live (CP_HQD_ACTIVE + PRELOAD_REQ).
+
+  Activating a KCQ whose MQD/ring/rptr/wptr live in GART **host sysmem** forces the
+  MEC to DMA-read those addresses at preload. On the M1/USB4 (AppleT8103 PCIe)
+  transport that device→host read is not serviceable and the bridge raises the
+  `apciec unhandled interrupts (0x200000)` error → macOS kernel panic. Keep queues
+  MQD-in-memory only (no activation) unless the operator explicitly opts in after a
+  proven device-DMA path. `--boot-stage=kcq-ring-test`/`add` set their own gates."""
+  return any(os.environ.get(k, "0") == "1" for k in (
+    "AMD_BOOT_KCQ_ACTIVATE", "AMD_BOOT_RING_TEST", "AMD_BOOT_ADD", "AMD_BOOT_FULL"))
+
 if TYPE_CHECKING:
   from add import PolarisDevice
 
@@ -2397,11 +2410,21 @@ class ComputeQueue:
 
     kcq_mode = os.environ.get("AMD_BOOT_KCQ_DIRECT", "auto")
     direct_kcq = kcq_mode == "1" or (kcq_mode == "auto" and not map_queues)
+    # HQD activation DMA-reads host sysmem at MEC preload → APCIE panic on USB4.
+    # Keep MQD-in-memory only unless explicitly opted in (see boot_allow_hqd_activation).
+    activate = direct_kcq and boot_allow_hqd_activation()
+    if direct_kcq and not activate:
+      kcq_mqd = mqd_init_vi(boot, self, is_kiq=False, activate=False)
+      self._upload_mqd(kcq_mqd)
+      boot.set_mec_doorbell_range()
+      print("polaris: KCQ MQD staged in memory; HQD activation gated "
+            "(set AMD_BOOT_KCQ_ACTIVATE=1 to make it live — DMA/panic risk)", flush=True)
+      return
 
     # 2) KCQ MQD — MAP_QUEUES activates HQD, or direct commit (TrustOS fallback)
-    kcq_mqd = mqd_init_vi(boot, self, is_kiq=False, activate=direct_kcq)
+    kcq_mqd = mqd_init_vi(boot, self, is_kiq=False, activate=activate)
     self._upload_mqd(kcq_mqd)
-    if direct_kcq:
+    if activate:
       boot.deactivate_hqd(self.me, self.pipe, self.queue)
       mqd_commit_vi(boot, self, kcq_mqd, deactivate=False)
       boot.set_mec_doorbell_range()
@@ -2431,7 +2454,8 @@ class ComputeQueue:
         break
       time.sleep(0.01)
     kcq_active = boot.read_hqd_active(self.me, self.pipe, self.queue)
-    if not (kcq_active & 1) and os.environ.get("AMD_BOOT_KCQ_DIRECT", "auto") == "auto":
+    if (not (kcq_active & 1) and os.environ.get("AMD_BOOT_KCQ_DIRECT", "auto") == "auto"
+        and boot_allow_hqd_activation()):
       print("polaris: MAP_QUEUES did not activate KCQ — trying direct HQD commit", flush=True)
       boot.deactivate_hqd(self.me, self.pipe, self.queue)
       kcq_mqd = mqd_init_vi(boot, self, is_kiq=False, activate=True)

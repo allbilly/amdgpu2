@@ -777,6 +777,11 @@ class PolarisDevice:
       print("stage=gart-probe ok"); return
     if stage == "kcq-direct":
       os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
+      if os.environ.get("AMD_BOOT_KCQ_ACTIVATE", "0") != "1":
+        print("note: kcq-direct stages the KCQ MQD but leaves the HQD inactive "
+              "(activation DMA-reads host sysmem → APCIE panic on USB4).", file=sys.stderr)
+        print("  Activate deliberately: AMD_BOOT_KCQ_ACTIVATE=1 python3 add.py --boot-stage=kcq-direct",
+              file=sys.stderr)
       self._boot_stage_kiq(b, map_queues=False, skip_fw=True); return
     if stage == "kcq-ring-test":
       if os.environ.get("AMD_BOOT_RING_TEST", "0") != "1":

@@ -2,7 +2,37 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-08 ~22:03 — APCIE panic #5; session stopped at `fw-mec`
+**Last updated:** 2026-07-08 ~22:40 — APCIE panic #6 root-caused to KCQ HQD activation; gated (crash fixed)
+
+## Session #6 — panic root cause + fix (2026-07-08 ~22:40)
+
+`--boot-stage=kiq` kernel-panicked macOS (reboot; BARs re-enumerated). Root cause is a
+regression introduced after commit `dcb3ef5` ("result 0 but no more crash"):
+
+- The WIP commit added a **direct KCQ HQD commit** path — `mqd_init_vi(..., activate=True)`
+  sets `CP_HQD_PERSISTENT_STATE.PRELOAD_REQ` + `CP_HQD_ACTIVE=1`. Committing it makes the
+  MEC **preload the queue context by DMA-reading the MQD/ring from GART host sysmem**.
+- On M1/USB4 (`AppleT8103PCIe`) that device→host read is not serviceable → PCIe completion
+  timeout → `apciec unhandled interrupts (0x200000)` → kernel panic. Masking the GPU's own
+  MSI/INTx (session #5 fix) does not help: it is the *bridge's* error interrupt on a failed
+  downstream transaction, not the GPU's own IRQ.
+- The `dcb3ef5` "no crash" version left the KCQ MQD **in memory only** (no activation), which
+  is exactly why `kiq` used to be safe. Activating the KIQ alone (no `PRELOAD_REQ`, empty ring)
+  was and remains safe.
+
+**Fix (`polaris_boot.boot_allow_hqd_activation`):** any HQD *activation* (the direct-KCQ
+`activate`/`PRELOAD_REQ` commit and its MAP_QUEUES auto-fallback) is now gated. Default =
+staged-in-memory only, no activation. `kiq`/`kcq-direct` are inspection-only again and no
+longer crash. Activation requires an explicit opt-in (`AMD_BOOT_KCQ_ACTIVATE=1`, or the
+already-gated `AMD_BOOT_RING_TEST=1` / `AMD_BOOT_ADD=1` / `AMD_BOOT_FULL=1`). Verified on HW:
+`kiq` runs to completion, `KIQ_HQD_ACTIVE=0x1`, `KCQ_HQD_ACTIVE=0x0`, no panic.
+
+**Still blocked (unchanged):** the actual vector-add needs a live KCQ, which needs proven
+device→host DMA. Until a posted-write-safe DMA proof exists, activating the KCQ will DMA host
+sysmem and can panic — hence the gate. Next real experiment must be a minimal device-DMA proof,
+not a compute dispatch.
+
+**Prior line:** 2026-07-08 ~22:03 — APCIE panic #5; session stopped at `fw-mec`
 
 ## Status
 
