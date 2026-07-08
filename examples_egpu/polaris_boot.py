@@ -39,6 +39,16 @@ def boot_allow_hqd_activation() -> bool:
   return any(os.environ.get(k, "0") == "1" for k in (
     "AMD_BOOT_KCQ_ACTIVATE", "AMD_BOOT_RING_TEST", "AMD_BOOT_ADD", "AMD_BOOT_FULL"))
 
+
+def boot_allow_sdma_probe() -> bool:
+  """Opt-in for --boot-stage=sdma-probe (device DMA via SDMA ring fetch).
+
+  Enabling the SDMA GFX ring makes the GPU DMA-read the ring from GART host sysmem —
+  same APCIE completion-timeout risk as KCQ HQD preload. Verification uses SDMA
+  WRITE_LINEAR (posted MemWr to host) + CPU readback of the dst buffer (no device read
+  for the pass/fail check). Gated behind AMD_BOOT_SDMA_PROBE=1."""
+  return os.environ.get("AMD_BOOT_SDMA_PROBE", "0") == "1"
+
 if TYPE_CHECKING:
   from add import PolarisDevice
 
@@ -100,6 +110,64 @@ mmSDMA1_UCODE_ADDR = 0x3600
 mmSDMA1_UCODE_DATA = 0x3601
 mmSDMA1_F32_CNTL = 0x3612
 SDMA1_REG_OFFSET = 0x200
+# oss_3_0_d.h — SDMA0 GFX ring (sdma_v2_4_gfx_resume)
+mmSDMA0_TILING_CONFIG = 0x3406
+mmSDMA0_SEM_WAIT_FAIL_TIMER_CNTL = 0x3409
+mmSDMA0_GFX_RB_CNTL = 0x3480
+mmSDMA0_GFX_RB_BASE = 0x3481
+mmSDMA0_GFX_RB_BASE_HI = 0x3482
+mmSDMA0_GFX_RB_RPTR = 0x3483
+mmSDMA0_GFX_RB_WPTR = 0x3484
+mmSDMA0_GFX_IB_CNTL = 0x348a
+mmSDMA0_GFX_CONTEXT_CNTL = 0x3493
+mmSDMA0_GFX_VIRTUAL_ADDR = 0x34a7
+mmSDMA0_GFX_APE1_CNTL = 0x34a8
+mmSDMA0_GFX_RB_WPTR_POLL_CNTL = 0x3485
+mmSDMA0_GFX_RB_RPTR_ADDR_HI = 0x3488
+mmSDMA0_GFX_RB_RPTR_ADDR_LO = 0x3489
+mmSDMA0_GFX_DOORBELL = 0x3492
+mmSDMA0_STATUS_REG = 0x340d
+SDMA0_STATUS_REG__IDLE_MASK = 0x1
+SDMA0_STATUS_REG__MC_RD_IDLE_MASK = 0x80000
+mmSRBM_SOFT_RESET = 0x0398
+SRBM_SOFT_RESET__SOFT_RESET_SDMA_MASK = 0x100000
+SRBM_SOFT_RESET__SOFT_RESET_SDMA1_MASK = 0x40
+# gmc_8_1_sh_mask.h MC_VM_MX_L1_TLB_CNTL
+MC_VM_MX_L1_TLB_CNTL__ENABLE_L1_TLB_MASK = 0x1
+MC_VM_MX_L1_TLB_CNTL__ENABLE_L1_FRAGMENT_PROCESSING_MASK = 0x2
+MC_VM_MX_L1_TLB_CNTL__SYSTEM_ACCESS_MODE_MASK = 0x18
+MC_VM_MX_L1_TLB_CNTL__SYSTEM_ACCESS_MODE__SHIFT = 3
+MC_VM_MX_L1_TLB_CNTL__SYSTEM_APERTURE_UNMAPPED_ACCESS_MASK = 0x20
+MC_VM_MX_L1_TLB_CNTL__ENABLE_ADVANCED_DRIVER_MODEL_MASK = 0x40
+SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK = 0x1000
+SDMA0_GFX_RB_WPTR_POLL_CNTL__ENABLE_MASK = 0x1
+SDMA0_GFX_DOORBELL__ENABLE_MASK = 0x10000000
+SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK = 0x1
+SDMA0_GFX_RB_CNTL__RB_ENABLE__SHIFT = 0
+SDMA0_GFX_RB_CNTL__RB_SIZE_MASK = 0x3e
+SDMA0_GFX_RB_CNTL__RB_SIZE__SHIFT = 1
+SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK = 0x1
+SDMA0_GFX_IB_CNTL__IB_ENABLE__SHIFT = 0
+SDMA_RING_SIZE = 4096  # bytes — amdgpu default; rb_size field = order_base_2(size/4)
+# tonga_sdma_pkt_open.h (VI / Polaris)
+SDMA_OP_NOP = 0
+SDMA_OP_WRITE = 2
+SDMA_SUBOP_WRITE_LINEAR = 0
+
+
+def _sdma_pkt_hdr(op: int, sub_op: int = 0) -> int:
+  return (op & 0xff) | ((sub_op & 0xff) << 8)
+
+
+def _reg_set_field(val: int, mask: int, shift: int, field: int) -> int:
+  return (val & ~mask) | ((field << shift) & mask)
+
+
+def _order_base_2(n: int) -> int:
+  o = 0
+  while (1 << o) < n:
+    o += 1
+  return o
 
 CP_ME_CNTL_HALT = 0x01000000 | 0x04000000 | 0x10000000  # CE|PFP|ME
 CP_MEC_CNTL_HALT = 0x40000000 | 0x10000000  # ME1|ME2
@@ -205,7 +273,15 @@ SMU_HDR_BUF_SIZE = 4096
 PAGE_SIZE = 4096
 
 # gmc_v8_0 GTT PTE: VALID|SYSTEM|SNOOPED|EXECUTABLE|READABLE|WRITEABLE (amdgpu_vm.h)
+# GCN VI page-table entries are 64-bit: pte = (dma_addr & mask) | flags.
 GART_PTE_FLAGS = 0x77
+GART_PTE_SIZE = 8            # gfx8 PTE is 8 bytes (amdgpu_gmc_set_pte_pde writes 64-bit)
+GART_PTE_ADDR_MASK = 0x0000FFFFFFFFF000  # [47:12] physical page address
+# VM_L2_CNTL4 — read PDE/PTE from host system RAM (gmc_8_1_sh_mask.h)
+VM_L2_CNTL4__CTX0_PDE_REQUEST_PHYSICAL = 0x40    # shift 6
+VM_L2_CNTL4__CTX0_PTE_REQUEST_PHYSICAL = 0x200   # shift 9
+VM_L2_CNTL4__CTX1_PDE_REQUEST_PHYSICAL = 0x1000  # shift 12
+VM_L2_CNTL4__CTX1_PTE_REQUEST_PHYSICAL = 0x8000  # shift 15
 
 SMU_HDR_SOFT_REGS_OFF = 0x20000 + 48  # offsetof(SMU74_Firmware_Header, SoftRegisters)
 SMU7_FIRMWARE_HEADER_LOCATION = 0x20000
@@ -498,6 +574,34 @@ class PolarisBoot:
       self.load_ip_firmware_direct(fw_mask, unhalt=unhalt)
     else:
       raise RuntimeError("boot_through_fw_direct: SMC not running")
+
+  def boot_sdma_minimal(self):
+    """Cold-GPU bring-up for the SDMA DMA proof with the smallest crash surface.
+
+    [optional ATOM asic_init] → apertures (FB + AGP) → SDMA-only ucode (halted).
+    Deliberately NO SMC start and NO RLC/CP/MEC: SDMA ucode is MMIO-uploaded and
+    doesn't need the SMU, and every extra live engine/fw bootstrap is another async
+    DMA source that can trip the USB4 root port (apciec 0x200000, session #10).
+    AMD_BOOT_SDMA_ATOM=0 (default) also skips the ATOM replay: the AGP probe never
+    touches VRAM, so memory training is unnecessary — the VBIOS-posted register
+    state is enough for the SDMA block + BIF (session #11)."""
+    self.vi_common_init()
+    if os.environ.get("AMD_BOOT_SDMA_ATOM", "0") == "1":
+      from atom_replay import run_asic_init_if_needed
+      self.enable_vbios_rom()
+      run_asic_init_if_needed(self)
+    self.gmc_sw_init()
+    self.mc_program()
+    # Cheap liveness gate: if the SDMA block isn't clocked without asic_init, fail
+    # cleanly here instead of uploading into a dead block / unhalting garbage.
+    self.wreg(mmSDMA0_GFX_RB_WPTR, 0xA5A58)
+    got = self.rreg(mmSDMA0_GFX_RB_WPTR)
+    self.wreg(mmSDMA0_GFX_RB_WPTR, 0)
+    if got != 0xA5A58:
+      raise RuntimeError(
+        f"SDMA regs not responding (wrote 0xA5A58, read {got:#x}) — "
+        "block needs asic_init; retry with AMD_BOOT_SDMA_ATOM=1")
+    self.load_sdma_firmware_only(unhalt=False)
 
 
   def fw(self, name: str) -> bytes:
@@ -1058,6 +1162,23 @@ class PolarisBoot:
         return
       time.sleep(0.001)
 
+  def mc_program_apertures(self):
+    """System + AGP apertures, gfx9-style (gfxhub_v1_0_init_system_aperture_regs).
+
+    A physical (VMID0, no-VM) MC address inside FB_LOCATION routes to VRAM; inside
+    [AGP_BOT, AGP_TOP] it routes out to the PCIe host at (addr - agp_start) since
+    AGP_BASE=0 — that is exactly amdgpu_gmc_agp_addr(): agp_start + dma_addr.
+    SYSTEM_APERTURE must cover FB∪AGP or AGP accesses hit the default page.
+    Linux gfx8 disables AGP, but the VI MC still implements it; we use it to reach
+    host RAM with NO page-table walk (progress.md session #10)."""
+    scratch = self.vram_visible_mc or self.vram_start
+    self.wreg(mmMC_VM_SYSTEM_APERTURE_LOW_ADDR, min(self.vram_start, self.agp_start) >> 12)
+    self.wreg(mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR, max(self.vram_end, self.agp_end) >> 12)
+    self.wreg(mmMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, scratch >> 12)
+    self.wreg(mmMC_VM_AGP_BASE, 0)
+    self.wreg(mmMC_VM_AGP_TOP, self.agp_end >> 22)
+    self.wreg(mmMC_VM_AGP_BOT, self.agp_start >> 22)
+
   def mc_program_light(self):
     """Minimal MC when VRAM not fully trained — avoid clobbering VBIOS apertures."""
     self.mc_init_locations()
@@ -1074,6 +1195,7 @@ class PolarisBoot:
       self.wreg(mmCONFIG_MEMSIZE, want_mb)
       tmp = ((self.vram_end >> 24) & 0xffff) << 16 | ((self.vram_start >> 24) & 0xffff)
       self.wreg(mmMC_VM_FB_LOCATION, tmp)
+    self.mc_program_apertures()
     self.wreg(mmBIF_FB_EN, 0x3)
     self.mmio_sync_safe()
     if int(os.environ.get("DEBUG", "0")):
@@ -1098,13 +1220,7 @@ class PolarisBoot:
       for off in (0xb05 + j, 0xb06 + j, 0xb07 + j, 0xb08 + j, 0xb09 + j):
         self.wreg(off, 0)
     self.wreg(mmHDP_REG_COHERENCY_FLUSH_CNTL, 0)
-    scratch = self.vram_visible_mc or self.vram_start
-    self.wreg(mmMC_VM_SYSTEM_APERTURE_LOW_ADDR, self.vram_start >> 12)
-    self.wreg(mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR, self.vram_end >> 12)
-    self.wreg(mmMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, scratch >> 12)
-    self.wreg(mmMC_VM_AGP_BASE, 0)
-    self.wreg(mmMC_VM_AGP_TOP, self.agp_end >> 22)
-    self.wreg(mmMC_VM_AGP_BOT, self.agp_start >> 22)
+    self.mc_program_apertures()
     self.wreg(mmBIF_FB_EN, 0x3)
     mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
     if mem_mb in (0, 0xffff) and self.vram_size:
@@ -1184,13 +1300,19 @@ class PolarisBoot:
     self.mmio_sync_safe()
 
   def _gart_program_vm(self, pte_base_addr: int, pte_physical: bool):
-    self.wreg(mmMC_VM_MX_L1_TLB_CNTL, 0x98000b)
+    # gmc_v8_0_gart_enable TLB control, field-exact (was 0x98000b: SYSTEM_ACCESS_MODE=1,
+    # no ADVANCED_DRIVER_MODEL — aperture/VM decode not fully active on gfx8).
+    self.mc_setup_tlb_apertures()
     self.wreg(mmVM_L2_CNTL, 0x30103)
     self.wreg(mmVM_L2_CNTL2, 0x30003)
     self.wreg(mmVM_L2_CNTL3, 0x24100003)
     l2c4 = 0
     if pte_physical:
-      l2c4 |= 1 << 9  # VMC_TAP_CONTEXT0_PTE_REQUEST_PHYSICAL
+      # Read the page table + PTEs from host system RAM (table not in VRAM).
+      l2c4 |= (VM_L2_CNTL4__CTX0_PDE_REQUEST_PHYSICAL |
+               VM_L2_CNTL4__CTX0_PTE_REQUEST_PHYSICAL |
+               VM_L2_CNTL4__CTX1_PDE_REQUEST_PHYSICAL |
+               VM_L2_CNTL4__CTX1_PTE_REQUEST_PHYSICAL)
     self.wreg(mmVM_L2_CNTL4, l2c4)
     gart_start = self.gart_start
     gart_end = self.gart_end
@@ -1219,38 +1341,43 @@ class PolarisBoot:
     self.mmio_sync_safe()
 
   def gart_enable(self):
-    gart_words = 256 * 1024 // 4
-    gart_bytes = gart_words * 4
+    gart_entries = self.gart_size // PAGE_SIZE           # one 64-bit PTE per 4K page
+    gart_bytes = gart_entries * GART_PTE_SIZE
     use_sysmem = os.environ.get("AMD_BOOT_GART_SYSMEM", "auto")
     if use_sysmem == "auto":
       use_sysmem = "0" if self.probe_bar0_writes() else "1"
     self.gart_pte_mem = bytearray(gart_bytes)
-    invalid_pte = struct.pack('<I', 0x10)
-    for i in range(gart_words):
-      self.gart_pte_mem[i * 4:i * 4 + 4] = invalid_pte
+    invalid_pte = struct.pack('<Q', 0)
+    for i in range(gart_entries):
+      self.gart_pte_mem[i * GART_PTE_SIZE:i * GART_PTE_SIZE + GART_PTE_SIZE] = invalid_pte
     if use_sysmem == "1":
-      mem, paddrs, _ = self.alloc_sysmem_buffer(gart_bytes)
+      # PTE table lives in host RAM. The MC page-table walker reads the table root
+      # and every PTE at a *physical* DMA address (PAGE_TABLE_BASE_ADDR + the PTE
+      # dwords), so the base must be the table's DMA/physical address and the L2
+      # PDE/PTE_REQUEST_PHYSICAL bits must be set. Previously we (a) used 4-byte
+      # PTEs — gfx8 PTEs are 64-bit, so the walker read misaligned garbage — and
+      # (b) pointed PAGE_TABLE_BASE_ADDR at a GART *VA* (self-map), which the MC
+      # cannot dereference as a root. Both made the first device DMA read a bogus
+      # host address → APCIE completion timeout / kernel panic (#5–#8).
+      # Must be physically contiguous: the walker addresses PTEs as base_phys + off.
+      mem, paddrs, _ = self.alloc_sysmem_buffer(gart_bytes, contiguous=True)
+      if not self._paddrs_contiguous(paddrs):
+        raise RuntimeError(
+          f"GART PTE table not physically contiguous ({len(paddrs)} pages) — "
+          f"host page-table walk needs a contiguous DMA buffer")
       self.gart_pte_sysmem = mem
-      npages_table = (gart_bytes + PAGE_SIZE - 1) // PAGE_SIZE
-      # Self-map: first GART slots point at this PTE table in host memory.
-      table_gpu_base = self.gart_start
-      self.gart_base = table_gpu_base
-      for i, paddr in enumerate(paddrs[:npages_table]):
-        off = i * 4
-        pte = ((paddr >> 12) << 12) | GART_PTE_FLAGS
-        struct.pack_into('<I', self.gart_pte_mem, off, pte)
-        mem[off:off + 4] = self.gart_pte_mem[off:off + 4]
-      invalid = struct.pack('<I', 0x10)
-      for i in range(npages_table, gart_words):
-        off = i * 4
-        self.gart_pte_mem[off:off + 4] = invalid
-        mem[off:off + 4] = invalid
+      self.gart_pte_phys = paddrs[0] & ~0xfff
+      self.gart_base = self.gart_pte_phys
+      for i in range(gart_entries):
+        off = i * GART_PTE_SIZE
+        self.gart_pte_mem[off:off + GART_PTE_SIZE] = invalid_pte
+        mem[off:off + GART_PTE_SIZE] = invalid_pte
       self._gart_pte_flush()
       self.hdp_flush()
-      self._gart_program_vm(table_gpu_base, pte_physical=False)
+      self._gart_program_vm(self.gart_pte_phys, pte_physical=True)
       if int(os.environ.get("DEBUG", "0")):
-        print(f"polaris: GART PTE self-map at {table_gpu_base:#x} "
-              f"phys={[hex(p) for p in paddrs[:2]]}", flush=True)
+        print(f"polaris: GART PTE table in host RAM base_phys={self.gart_pte_phys:#x} "
+              f"entries={gart_entries} bytes={gart_bytes:#x}", flush=True)
     else:
       self.gart_pte_off = self.dev.alloc_vram(gart_bytes, align=PAGE_SIZE)
       self.dev.upload(self.gart_pte_off, bytes(self.gart_pte_mem))
@@ -1270,12 +1397,21 @@ class PolarisBoot:
   def _gart_write_pte(self, pte_off: int, pte_val: int):
     if self.gart_pte_mem is None:
       return
-    chunk = struct.pack('<I', pte_val)
-    self.gart_pte_mem[pte_off:pte_off + 4] = chunk
+    chunk = struct.pack('<Q', pte_val & 0xffffffffffffffff)
+    self.gart_pte_mem[pte_off:pte_off + GART_PTE_SIZE] = chunk
     if self.gart_pte_sysmem is not None:
-      self.gart_pte_sysmem[pte_off:pte_off + 4] = chunk
+      self.gart_pte_sysmem[pte_off:pte_off + GART_PTE_SIZE] = chunk
     elif self.gart_pte_off:
       self.dev.upload(self.gart_pte_off + pte_off, chunk)
+
+  @staticmethod
+  def _encode_pte(paddr: int) -> int:
+    """gfx8 64-bit GTT PTE: physical page addr [47:12] | flags."""
+    return (paddr & GART_PTE_ADDR_MASK) | GART_PTE_FLAGS
+
+  @staticmethod
+  def _paddrs_contiguous(paddrs: list[int]) -> bool:
+    return all(paddrs[i] == paddrs[0] + i * PAGE_SIZE for i in range(len(paddrs)))
 
   def _gart_pte_flush(self):
     # Flush host PTE table so eGPU DMA sees GART updates (M1 lacks IO coherency).
@@ -1291,9 +1427,9 @@ class PolarisBoot:
       npages = (size + 0xfff) // 0x1000
       base_pfn = (gpu_va - self.gart_start) >> 12
       for i, paddr in enumerate(paddrs[:npages]):
-        off = (base_pfn + i) * 4
-        if off + 4 <= len(self.gart_pte_mem):
-          self._gart_write_pte(off, (paddr >> 12) << 12 | GART_PTE_FLAGS)
+        off = (base_pfn + i) * GART_PTE_SIZE
+        if off + GART_PTE_SIZE <= len(self.gart_pte_mem):
+          self._gart_write_pte(off, self._encode_pte(paddr))
       self._gart_pte_flush()
       self.hdp_flush()
     self.gart_flush_tlb()
@@ -1358,11 +1494,80 @@ class PolarisBoot:
       toc += pack_smu_toc_entry(ucode_id, ver, addr, sz, flags)
     return toc, entries
 
-  def agp_mc_addr(self, paddr: int) -> int:
+  def agp_mc_addr(self, paddr: int, size: int = PAGE_SIZE) -> int:
     """amdgpu_gmc_agp_addr: agp_start + dma_address (full phys, VI rarely uses AGP)."""
-    if paddr + PAGE_SIZE >= self.agp_size:
+    if paddr + size > self.agp_size:
       raise ValueError(f"paddr {paddr:#x} outside AGP aperture size {self.agp_size:#x}")
     return self.agp_start + paddr
+
+  def alloc_agp_buffer(self, size: int) -> tuple[int, object, list[int]]:
+    """Host sysmem reachable through the AGP aperture — NO GART page table involved.
+
+    The MC routes agp_start+dma_addr straight out to PCIe (mc_program_apertures), so
+    the only device→host transaction for an SDMA ring here is the ring fetch itself:
+    no page-table-walk read that could hit the FB aperture / a bogus address
+    (progress.md session #10 hypothesis for the apciec 0x200000 panics)."""
+    nbytes = round_up(size, PAGE_SIZE)
+    mem, paddrs, _ = self.alloc_sysmem_buffer(nbytes, contiguous=True)
+    if not paddrs or not self._paddrs_contiguous(paddrs):
+      raise RuntimeError("alloc_agp_buffer: need physically contiguous DMA pages")
+    mc_addr = self.agp_mc_addr(paddrs[0], nbytes)
+    from add import sysmem_dma_flush
+    sysmem_dma_flush(mem, nbytes)
+    return mc_addr, mem, paddrs
+
+  def vm_context0_disable(self):
+    """Force VMID0 back to pure physical addressing (VBIOS-default, no translation).
+
+    Needed for the AGP probe: if a previous GART bring-up left VM context0 enabled,
+    an AGP MC address (>= 4 GB) would be pushed through the GART page table, miss its
+    range and fault instead of routing via the AGP aperture."""
+    self.wreg(mmVM_CONTEXT0_CNTL, 0)
+    self.wreg(mmVM_INVALIDATE_REQUEST, 1)
+    self.mmio_sync_safe()
+
+  def mc_setup_tlb_apertures(self):
+    """gmc_v8_0_gart_enable TLB control — REQUIRED for FB/AGP aperture routing.
+
+    First AGP probe attempt stalled forever (SDMA0_STATUS_REG IDLE=0, MC_RD_IDLE=0):
+    the ring-fetch MC read never left the chip because the VBIOS-default
+    MC_VM_MX_L1_TLB_CNTL (0x503) has SYSTEM_ACCESS_MODE=0 and
+    ENABLE_ADVANCED_DRIVER_MODEL=0, i.e. system/AGP aperture decoding is OFF.
+    Program it exactly like Linux gmc_v8_0_gart_enable: L1 TLB on, fragment
+    processing on, SYSTEM_ACCESS_MODE=3 (not-in-sys), advanced driver model on,
+    unmapped-access=0 (default page instead of dropped request)."""
+    tmp = self.rreg(mmMC_VM_MX_L1_TLB_CNTL)
+    tmp |= (MC_VM_MX_L1_TLB_CNTL__ENABLE_L1_TLB_MASK |
+            MC_VM_MX_L1_TLB_CNTL__ENABLE_L1_FRAGMENT_PROCESSING_MASK |
+            MC_VM_MX_L1_TLB_CNTL__ENABLE_ADVANCED_DRIVER_MODEL_MASK)
+    tmp = (tmp & ~MC_VM_MX_L1_TLB_CNTL__SYSTEM_ACCESS_MODE_MASK) | \
+          (3 << MC_VM_MX_L1_TLB_CNTL__SYSTEM_ACCESS_MODE__SHIFT)
+    tmp &= ~MC_VM_MX_L1_TLB_CNTL__SYSTEM_APERTURE_UNMAPPED_ACCESS_MASK
+    self.wreg(mmMC_VM_MX_L1_TLB_CNTL, tmp)
+    self.wreg(mmVM_INVALIDATE_REQUEST, 1)
+    self.mmio_sync_safe()
+
+  def sdma_soft_reset(self):
+    """sdma_v3_0_soft_reset: SRBM soft reset both SDMA instances.
+
+    Recovers a wedged engine (e.g. stuck MC read with MC_RD_IDLE=0 after an AGP
+    fetch that could not route). A stuck in-flight read is also a suspect for the
+    delayed 'spontaneous' apciec panics, so always clear it before re-probing."""
+    self.sdma_enable(False)
+    tmp = self.rreg(mmSRBM_SOFT_RESET)
+    tmp |= SRBM_SOFT_RESET__SOFT_RESET_SDMA_MASK | SRBM_SOFT_RESET__SOFT_RESET_SDMA1_MASK
+    self.wreg(mmSRBM_SOFT_RESET, tmp)
+    self.mmio_sync_safe()
+    time.sleep(0.05)
+    tmp &= ~(SRBM_SOFT_RESET__SOFT_RESET_SDMA_MASK | SRBM_SOFT_RESET__SOFT_RESET_SDMA1_MASK)
+    self.wreg(mmSRBM_SOFT_RESET, tmp)
+    self.mmio_sync_safe()
+    time.sleep(0.05)
+    # soft reset re-halts F32 and wipes the uploaded ucode state
+    self._sdma_fw_resident = False
+
+  def sdma_engine_idle(self) -> bool:
+    return bool(self.rreg(mmSDMA0_STATUS_REG) & SDMA0_STATUS_REG__IDLE_MASK)
 
   def ensure_gart_ready(self):
     """Linux amdgpu_ttm_alloc_gart binds PTEs at sw_init; enable GART before LoadUcodes on eGPU."""
@@ -1403,13 +1608,13 @@ class PolarisBoot:
     src_mem[0:4] = struct.pack('<I', pat)
     sysmem_dma_flush(src_mem, PAGE_SIZE)
     base_pfn = (src_va - self.gart_start) >> 12
-    pte_off = base_pfn * 4
-    pte_cpu = struct.unpack_from('<I', self.gart_pte_mem, pte_off)[0]
-    expected_pte = ((paddrs[0] >> 12) << 12) | GART_PTE_FLAGS
+    pte_off = base_pfn * GART_PTE_SIZE
+    pte_cpu = struct.unpack_from('<Q', self.gart_pte_mem, pte_off)[0]
+    expected_pte = self._encode_pte(paddrs[0])
     pte_host = 0
     if self.gart_pte_sysmem is not None:
-      pte_host = struct.unpack_from('<I', bytes(self.gart_pte_sysmem[pte_off:pte_off + 4]), 0)[0]
-    self_map = struct.unpack_from('<I', self.gart_pte_mem, 0)[0]
+      pte_host = struct.unpack_from('<Q', bytes(self.gart_pte_sysmem[pte_off:pte_off + GART_PTE_SIZE]), 0)[0]
+    self_map = struct.unpack_from('<Q', self.gart_pte_mem, 0)[0]
     ok = (pte_cpu == expected_pte) and (not self.gart_pte_sysmem or pte_host == expected_pte)
     result = {
       "gart_start": self.gart_start,
@@ -1427,6 +1632,186 @@ class PolarisBoot:
           f"pte={pte_cpu:#x} expected={expected_pte:#x} self_map={self_map:#x}")
     if not ok:
       raise RuntimeError(f"GART PTE mismatch: got {pte_cpu:#x} expected {expected_pte:#x}")
+    return result
+
+  def sdma_fw_ready(self) -> bool:
+    """SDMA F32 unhalted (firmware resident and running)."""
+    return (self.rreg(mmSDMA0_F32_CNTL) & SDMA_F32_CNTL_HALT) == 0
+
+  def _sdma_gfx_ring_disable(self, off: int = 0):
+    """sdma_v3_0_gfx_stop for one instance: clear RB_ENABLE + IB_ENABLE, zero base/ptrs.
+
+    Panic #7 root cause: unhalting SDMA F32 while a stale RB_ENABLE=1 / garbage
+    RB_BASE survived from a prior session made the engine immediately DMA-read a
+    bogus ring address over USB4 (APCIE completion timeout). Always fully quiesce
+    the ring — and zero RB_BASE — before any F32 halt/unhalt."""
+    rb_cntl = self.rreg(mmSDMA0_GFX_RB_CNTL + off)
+    self.wreg(mmSDMA0_GFX_RB_CNTL + off,
+              rb_cntl & ~SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK)
+    ib_cntl = self.rreg(mmSDMA0_GFX_IB_CNTL + off)
+    self.wreg(mmSDMA0_GFX_IB_CNTL + off,
+              ib_cntl & ~SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK)
+    self.wreg(mmSDMA0_GFX_RB_WPTR + off, 0)
+    self.wreg(mmSDMA0_GFX_RB_RPTR + off, 0)
+    self.wreg(mmSDMA0_GFX_RB_BASE + off, 0)
+    self.wreg(mmSDMA0_GFX_RB_BASE_HI + off, 0)
+
+  def _sdma_gfx_ring_setup(self, ring_gpu_va: int, ring_bytes: int = SDMA_RING_SIZE):
+    """sdma_v2_4_gfx_resume ring programming — ring buffer must live in GART sysmem."""
+    self.disable_gpu_interrupts("pre-sdma-ring")
+    self._sdma_gfx_ring_disable()
+    self.wreg(mmSDMA0_GFX_VIRTUAL_ADDR, 0)
+    self.wreg(mmSDMA0_GFX_APE1_CNTL, 0)
+    # TrustOS: CONTEXT_CNTL!=0 can make F32 touch VRAM outside GART → VM fault.
+    self.wreg(mmSDMA0_GFX_CONTEXT_CNTL, 0)
+    self.wreg(mmSDMA0_SEM_WAIT_FAIL_TIMER_CNTL, 0)
+    rb_bufsz = _order_base_2(ring_bytes // 4)
+    rb_cntl = self.rreg(mmSDMA0_GFX_RB_CNTL)
+    rb_cntl = _reg_set_field(rb_cntl, SDMA0_GFX_RB_CNTL__RB_SIZE_MASK,
+                             SDMA0_GFX_RB_CNTL__RB_SIZE__SHIFT, rb_bufsz)
+    # Keep every *engine-initiated* device DMA off this probe: no rptr writeback
+    # (would DMA-write the rptr report to host), no wptr shadow poll (would DMA-read
+    # a host wptr), no doorbell. Only the ring fetch itself is a device→host read.
+    rb_cntl &= ~SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK
+    self.wreg(mmSDMA0_GFX_RB_CNTL, rb_cntl & ~SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK)
+    self.wreg(mmSDMA0_GFX_RB_RPTR, 0)
+    self.wreg(mmSDMA0_GFX_RB_WPTR, 0)
+    self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_HI, 0)
+    self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_LO, 0)
+    self.wreg(mmSDMA0_GFX_RB_WPTR_POLL_CNTL,
+              self.rreg(mmSDMA0_GFX_RB_WPTR_POLL_CNTL) & ~SDMA0_GFX_RB_WPTR_POLL_CNTL__ENABLE_MASK)
+    self.wreg(mmSDMA0_GFX_DOORBELL,
+              self.rreg(mmSDMA0_GFX_DOORBELL) & ~SDMA0_GFX_DOORBELL__ENABLE_MASK)
+    self.wreg(mmSDMA0_GFX_RB_BASE, ring_gpu_va >> 8)
+    self.wreg(mmSDMA0_GFX_RB_BASE_HI, (ring_gpu_va >> 40) & 0xffffffff)
+    ib_cntl = self.rreg(mmSDMA0_GFX_IB_CNTL)
+    ib_cntl = _reg_set_field(ib_cntl, SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK,
+                             SDMA0_GFX_IB_CNTL__IB_ENABLE__SHIFT, 1)
+    self.wreg(mmSDMA0_GFX_IB_CNTL, ib_cntl)
+    rb_cntl = _reg_set_field(rb_cntl, SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK,
+                             SDMA0_GFX_RB_CNTL__RB_ENABLE__SHIFT, 1)
+    self.wreg(mmSDMA0_GFX_RB_CNTL, rb_cntl)
+    if not self.sdma_fw_ready():
+      self.sdma_enable(True)
+    self.hdp_flush()
+    self.gart_flush_tlb()
+    self.mmio_sync_safe()
+
+  def _sdma_gfx_ring_commit(self, ring_mem, pkt_dwords: list[int]):
+    """Write pkt_dwords into ring[0..] and bump WPTR (byte offset in register)."""
+    from add import sysmem_dma_flush
+    nbytes = len(pkt_dwords) * 4
+    for i, dw in enumerate(pkt_dwords):
+      ring_mem[i * 4:(i + 1) * 4] = struct.pack('<I', dw)
+    sysmem_dma_flush(ring_mem, nbytes)
+    self.hdp_flush()
+    self.gart_flush_tlb()
+    self.wreg(mmSDMA0_GFX_RB_WPTR, len(pkt_dwords) << 2)
+
+  def probe_sdma_dma(self) -> dict:
+    """Device DMA proof: SDMA WRITE_LINEAR → host buffer (sdma_v2_4_ring_test_ring).
+
+    Linux amdgpu uses the same pattern: one WRITE_LINEAR dword to a wb buffer, CPU
+    polls the dst for 0xDEADBEEF. Ring fetch is a device→host read (APCIE risk on
+    M1/USB4); dst verification is CPU-only (posted write, no completion).
+
+    Two addressing modes for the ring/dst:
+      AMD_BOOT_SDMA_AGP=1 (default): AGP aperture — linear MC window straight to
+        host physical, NO page table, NO walker reads (session #10: suspected the
+        PTE walk itself is what the USB4 root port kills).
+      AMD_BOOT_SDMA_AGP=0: GART page table in host RAM (64-bit PTEs, physical base).
+
+    Requires SDMA ucode resident (upload happens halted; this probe unhalts only
+    after RB_BASE points at a valid ring). Gated by AMD_BOOT_SDMA_PROBE=1."""
+    if not boot_allow_sdma_probe():
+      raise RuntimeError(
+        "SDMA device-DMA probe gated — set AMD_BOOT_SDMA_PROBE=1 (APCIE panic risk)")
+    from add import sysmem_dma_flush
+    use_agp = os.environ.get("AMD_BOOT_SDMA_AGP", "1") == "1"
+    if not self.sdma_fw_resident():
+      raise RuntimeError(
+        "SDMA ucode not resident — run: python3 add.py --boot-stage=fw-sdma first "
+        "(this probe unhalts SDMA itself once the ring is programmed).")
+    if use_agp:
+      self.gmc_sw_init()
+      self.mc_program_apertures()      # make sure SYSTEM_APERTURE covers FB∪AGP
+      self.mc_setup_tlb_apertures()    # L1 TLB + aperture decode ON (else fetch stalls)
+      self.vm_context0_disable()       # VMID0 = physical → AGP window routes to host
+      pte = {"mode": "agp", "agp_start": self.agp_start}
+    else:
+      pte = self.probe_gart_dma()
+      pte["mode"] = "gart"
+    # Do NOT unhalt yet: _sdma_gfx_ring_setup unhalts F32 only after RB_BASE points at
+    # the ring below, so the engine never DMA-reads a stale/garbage address.
+    if use_agp:
+      ring_va, ring_mem, _ = self.alloc_agp_buffer(SDMA_RING_SIZE)
+    else:
+      ring_va, ring_mem, _ = self.alloc_gtt_buffer(SDMA_RING_SIZE)
+    for i in range(SDMA_RING_SIZE // 4):
+      ring_mem[i * 4:(i + 1) * 4] = struct.pack('<I', 0)
+    sysmem_dma_flush(ring_mem, SDMA_RING_SIZE)
+    if use_agp:
+      dst_va, dst_mem, dst_paddrs = self.alloc_agp_buffer(PAGE_SIZE)
+    else:
+      dst_va, dst_mem, dst_paddrs = self.alloc_gtt_buffer(PAGE_SIZE)
+    sentinel = 0xCAFEDEAD
+    expect = 0xDEADBEEF
+    dst_mem[0:4] = struct.pack('<I', sentinel)
+    sysmem_dma_flush(dst_mem, PAGE_SIZE)
+    self._sdma_gfx_ring_setup(ring_va, SDMA_RING_SIZE)
+    # sdma_v2_4_ring_test_ring: 5-dword WRITE_LINEAR packet
+    pkt = [
+      _sdma_pkt_hdr(SDMA_OP_WRITE, SDMA_SUBOP_WRITE_LINEAR),
+      dst_va & 0xffffffff,
+      (dst_va >> 32) & 0xffffffff,
+      1,  # SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(1)
+      expect,
+    ]
+    self._sdma_gfx_ring_commit(ring_mem, pkt)
+    timeout_s = float(os.environ.get("AMD_BOOT_SDMA_PROBE_TIMEOUT_S", "5"))
+    deadline = time.time() + timeout_s
+    write_ok = False
+    last_val = sentinel
+    while time.time() < deadline:
+      last_val = struct.unpack('<I', bytes(dst_mem[0:4]))[0]
+      if last_val == expect:
+        write_ok = True
+        break
+      time.sleep(0.001)
+    rptr = self.rreg(mmSDMA0_GFX_RB_RPTR) >> 2
+    wptr = len(pkt)
+    result = {
+      **pte,
+      "ring_va": ring_va,
+      "dst_va": dst_va,
+      "dst_paddr": dst_paddrs[0],
+      "write_ok": write_ok,
+      "dst_value": last_val,
+      "expect": expect,
+      "rptr_dw": rptr,
+      "wptr_dw": wptr,
+      "ring_drained": rptr >= wptr,
+      "f32_cntl": self.rreg(mmSDMA0_F32_CNTL),
+      "rb_cntl": self.rreg(mmSDMA0_GFX_RB_CNTL),
+      "status_reg": self.rreg(mmSDMA0_STATUS_REG),
+    }
+    result["engine_idle"] = bool(result["status_reg"] & SDMA0_STATUS_REG__IDLE_MASK)
+    result["mc_rd_idle"] = bool(result["status_reg"] & SDMA0_STATUS_REG__MC_RD_IDLE_MASK)
+    print(f"sdma_probe write_ok={write_ok} dst={last_val:#x} expect={expect:#x} "
+          f"rptr_dw={rptr} wptr_dw={wptr} ring_drained={result['ring_drained']} "
+          f"dst_paddr={dst_paddrs[0]:#x} status={result['status_reg']:#x} "
+          f"idle={result['engine_idle']} mc_rd_idle={result['mc_rd_idle']}", flush=True)
+    if not write_ok:
+      print("sdma_probe: WRITE_LINEAR did not update dst — ring fetch or host DMA failed",
+            flush=True)
+      if not result["mc_rd_idle"]:
+        # The MC read for the ring fetch is still outstanding — a wedged in-flight
+        # read is a suspect for the delayed apciec panics. Reset SDMA to kill it.
+        print("sdma_probe: MC read outstanding (fetch stalled) — soft-resetting SDMA",
+              flush=True)
+        self.sdma_soft_reset()
+        result["status_after_reset"] = self.rreg(mmSDMA0_STATUS_REG)
+        print(f"sdma_probe: post-reset status={result['status_after_reset']:#x}", flush=True)
     return result
 
   def cp_gfx_enable(self, enable: bool):
@@ -1499,6 +1884,12 @@ class PolarisBoot:
     time.sleep(0.05)
 
   def sdma_enable(self, enable: bool):
+    # sdma_v3_0_enable: when halting, stop the gfx rings FIRST so the next unhalt
+    # never fetches a stale RB_BASE (panic #7). RB_ENABLE / RB_BASE are left zeroed,
+    # so unhalting here is safe until _sdma_gfx_ring_setup programs a real ring.
+    if not enable:
+      for off in (0, SDMA1_REG_OFFSET):
+        self._sdma_gfx_ring_disable(off)
     for off in (0, SDMA1_REG_OFFSET):
       reg = mmSDMA0_F32_CNTL + off
       tmp = self.rreg(reg)
@@ -1508,6 +1899,40 @@ class PolarisBoot:
         tmp |= SDMA_F32_CNTL_HALT
       self.wreg(reg, tmp)
     time.sleep(0.05)
+
+  def load_sdma_firmware_only(self, unhalt: bool = False):
+    """Upload ONLY SDMA0/SDMA1 ucode via MMIO, leaving a live CP/MEC untouched.
+
+    fw-sdma on a hot GPU must not re-halt/re-upload the running MEC (panic #7 was a
+    full ~200s compute-fw re-bootstrap on USB4). SDMA ucode is small and independent:
+    halt SDMA (with ring teardown), stream the two ucode blobs, keep F32 halted by
+    default. The GART ring is only programmed + unhalted later in _sdma_gfx_ring_setup
+    (option 4 in the fix plan) so the engine never fetches before a valid RB_BASE."""
+    want = (
+      (UCODE_ID_SDMA0, "polaris10_sdma.bin", mmSDMA0_UCODE_ADDR, mmSDMA0_UCODE_DATA),
+      (UCODE_ID_SDMA1, "polaris10_sdma1.bin", mmSDMA1_UCODE_ADDR, mmSDMA1_UCODE_DATA),
+    )
+    self.sdma_enable(False)  # gfx_stop (RB/IB off, base zeroed) + F32 HALT
+    loaded = []
+    for _ucode_id, name, addr_reg, data_reg in want:
+      blob = self.fw(name)
+      words, version = self._fw_ucode_words(blob)
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: direct sdma ucode {name} words={len(words)} ver={version:#x}", flush=True)
+      self._mmio_load_ucode(addr_reg, data_reg, words, version, label=name)
+      loaded.append(name)
+    self._sdma_fw_resident = True
+    if unhalt:
+      self.disable_gpu_interrupts("pre-unhalt-sdma")
+      self.sdma_enable(True)
+    print(f"polaris: SDMA-only firmware loaded ({', '.join(loaded)}) "
+          f"unhalt={unhalt} F32_CNTL={self.rreg(mmSDMA0_F32_CNTL):#x}", flush=True)
+
+  def sdma_fw_resident(self) -> bool:
+    """Best-effort: SDMA ucode present. F32 unhalted proves it; else trust our flag
+    set by an upload earlier in this process (GPU state persists across CLI runs but
+    the object does not, so cold callers should just upload)."""
+    return self.sdma_fw_ready() or getattr(self, "_sdma_fw_resident", False)
 
   def _fw_ucode_words(self, blob: bytes) -> tuple[list[int], int]:
     ucode_off, ucode_sz = parse_common_fw(blob)
@@ -1596,6 +2021,10 @@ class PolarisBoot:
         print(f"polaris: direct {name} ok in {time.time()-t0:.1f}s", flush=True)
       if pause_ms:
         time.sleep(pause_ms / 1000.0)
+    if fw_mask & (UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK):
+      self._sdma_fw_resident = True
+    if fw_mask & (UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK):
+      self._sdma_fw_resident = True
     if fw_mask & UCODE_ID_RLC_G_MASK:
       self.rlc_start()
     if unhalt:

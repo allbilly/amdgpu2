@@ -24,6 +24,8 @@ Usage:
   python3 examples_egpu/add.py --boot-stage=fw-cp       # + PFP/CE/ME
   python3 examples_egpu/add.py --boot-stage=fw-mec      # upload MEC, stay halted (~15s)
   python3 examples_egpu/add.py --boot-stage=fw-start    # settle + unhalt ME1 only
+  python3 examples_egpu/add.py --boot-stage=fw-sdma     # + SDMA upload + unhalt
+  AMD_BOOT_SDMA_PROBE=1 python3 examples_egpu/add.py --boot-stage=sdma-probe  # device DMA test
   python3 examples_egpu/add.py --boot-stage=fw-direct   # default RLC-only; full: AMD_BOOT_FW_MASK=0x47e
   python3 examples_egpu/add.py --boot-stage=kiq       # + KIQ MQD (no MAP_QUEUES doorbell)
   AMD_BOOT_FULL=1 python3 examples_egpu/add.py        # full vector-add (dangerous)
@@ -756,9 +758,23 @@ class PolarisDevice:
       b.unhalt_loaded_firmware(fw_mask)
       print(f"stage=fw-start mask={fw_mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x}"); return
     if stage == "fw-sdma":
-      from polaris_boot import FW_COMPUTE_MIN, UCODE_ID_SDMA0_MASK, UCODE_ID_SDMA1_MASK, mmCP_MEC_CNTL
-      mask = self._boot_stage_fw_direct(b, fw_mask=FW_COMPUTE_MIN | UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK)
-      print(f"stage=fw-sdma mask={mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x}"); return
+      from polaris_boot import (FW_COMPUTE_MIN, UCODE_ID_SDMA0_MASK, UCODE_ID_SDMA1_MASK,
+                                mmCP_MEC_CNTL, mmSDMA0_F32_CNTL)
+      # Default halted (panic #7): sdma-probe unhalts only after the ring is in GART.
+      unhalt = os.environ.get("AMD_BOOT_FW_UNHALT", "0") == "1"
+      if b.compute_fw_loaded():
+        # Hot GPU: SDMA-only incremental upload — do NOT re-halt/re-upload the live MEC.
+        b.load_sdma_firmware_only(unhalt=unhalt)
+        sdma_only = True
+      else:
+        # Cold GPU: full bring-up is required (SMC/MC/GART) plus SDMA, but keep SDMA
+        # halted with rings torn down so the F32 unhalt cannot fetch garbage.
+        self._boot_stage_fw_direct(
+          b, fw_mask=FW_COMPUTE_MIN | UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK, unhalt=unhalt)
+        sdma_only = False
+      print(f"stage=fw-sdma sdma_only={sdma_only} unhalt={unhalt} "
+            f"CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} F32_CNTL={b.rreg(mmSDMA0_F32_CNTL):#x} "
+            f"(ring torn down; run --boot-stage=sdma-probe to unhalt + prove DMA)"); return
     if stage == "fw-direct":
       from polaris_boot import mmCP_MEC_CNTL
       mask = self._boot_stage_fw_direct(b)
@@ -775,6 +791,40 @@ class PolarisDevice:
     if stage == "gart-probe":
       b.probe_gart_dma()
       print("stage=gart-probe ok"); return
+    if stage == "sdma-probe":
+      if os.environ.get("AMD_BOOT_SDMA_PROBE", "0") != "1":
+        print("GATED: sdma-probe — device DMA-reads SDMA ring from GART host sysmem "
+              "(APCIE completion-timeout / kernel-panic risk on M1 USB4).", file=sys.stderr)
+        print("  Prereq: python3 add.py --boot-stage=fw-sdma", file=sys.stderr)
+        print("  Then:   sleep 10", file=sys.stderr)
+        print("  Run:    AMD_BOOT_SDMA_PROBE=1 python3 add.py --boot-stage=sdma-probe",
+              file=sys.stderr)
+        sys.exit(2)
+      from polaris_boot import mmSDMA0_F32_CNTL
+      use_agp = os.environ.get("AMD_BOOT_SDMA_AGP", "1") == "1"
+      if b.compute_fw_loaded():
+        # Hot GPU: never touch the live MEC — only make sure SDMA ucode is resident
+        # (halted). AGP mode needs no GART; probe_sdma_dma programs apertures itself.
+        if not b.sdma_fw_resident():
+          b.load_sdma_firmware_only(unhalt=False)
+        if not use_agp:
+          b.gmc_sw_init()
+          os.environ["AMD_BOOT_GART_SYSMEM"] = "1"
+          if b.gart_pte_mem is None:
+            b.gart_enable()
+      else:
+        # Cold GPU: smallest possible bring-up — ATOM + apertures + SDMA ucode only.
+        # No SMC, no RLC/CP/MEC (each is an extra async-DMA crash surface, session #10).
+        b.boot_sdma_minimal()
+        if not use_agp:
+          os.environ["AMD_BOOT_GART_SYSMEM"] = "1"
+          if b.gart_pte_mem is None:
+            b.gart_enable()
+      r = b.probe_sdma_dma()
+      print(f"stage=sdma-probe mode={r.get('mode')} write_ok={r['write_ok']} "
+            f"ring_drained={r['ring_drained']} dst={r['dst_value']:#x} "
+            f"F32_CNTL={b.rreg(mmSDMA0_F32_CNTL):#x}")
+      return
     if stage == "kcq-direct":
       os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
       if os.environ.get("AMD_BOOT_KCQ_ACTIVATE", "0") != "1":
@@ -957,7 +1007,7 @@ def main():
   if os.environ.get("AMD_BOOT_FULL") != "1":
     print("BLOCKED: full boot can kernel-panic macOS over USB4.", file=sys.stderr)
     print("  Safe:  python3 add.py --probe | --selftest | --boot-stage=atom | --boot-stage=pre-fw", file=sys.stderr)
-    print("  Stage: python3 add.py --boot-stage=fw-rlc | fw-cp | fw-mec | --boot-stage=gart-probe", file=sys.stderr)
+    print("  Stage: python3 add.py --boot-stage=fw-rlc | fw-cp | fw-mec | fw-sdma | gart-probe | sdma-probe", file=sys.stderr)
     print("         python3 add.py --boot-stage=kcq-direct | kcq-ring-test", file=sys.stderr)
     print("  Add:   AMD_BOOT_ADD=1 python3 add.py --boot-stage=add", file=sys.stderr)
     print("  Full:  AMD_BOOT_FULL=1 python3 add.py   (only after kcq-ring-test passes)", file=sys.stderr)

@@ -2,7 +2,418 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-08 ~22:40 — APCIE panic #6 root-caused to KCQ HQD activation; gated (crash fixed)
+**Last updated:** 2026-07-09 ~01:46 — **current blocker: reboot loop from mid-asic_init GPU state**
+
+## Current blocker (read this first)
+
+We are **not** blocked on "can TinyGPU do DMA at all" — the NV eGPU path proves
+device→host DMA over this USB4 transport works. We are blocked on **two coupled
+problems**:
+
+### 1. Reboot loop — the GPU is in a dangerous persistent state
+
+The eGPU enclosure keeps the card powered across macOS reboots. After the
+**interrupted** ATOM `asic_init` at ~01:33 (`AMD_ATOM_JUMP_MAX=512` aborted a
+training loop at `MISC0=0x50609162`), the ASIC was left **mid-init** — worse than
+the previous "stale but idle" state.
+
+Since then, **every** macOS boot re-enumerates that broken device and the Apple T8103
+USB4 root port panics within seconds-to-minutes — often with **no** `add.py` command
+running (01:28 spontaneous, 01:41 panic ~20 s after a read-only `--probe`). This is
+a **reboot loop**, not a single bad boot-stage.
+
+**Must recover before any further bring-up:**
+1. Physical power-cycle the eGPU enclosure (unplug/replug TB), **or**
+2. `python3 add.py --reset` (AMD cfg 0x7c `vi_asic_pci_config_reset`) immediately
+   after boot, before macOS has time to touch the device
+3. Then run a **complete** ATOM `asic_init` with the **default** jump budget — never
+   cap with `AMD_ATOM_JUMP_MAX=512` again
+
+### 2. Device→host DMA proof still unproven — needs full ATOM, not minimal boot
+
+| boot path | device→host read | result |
+|-----------|------------------|--------|
+| Minimal (no ATOM, no SMC, no MEC) + AGP or GART | MC read stalls inside chip (`MC_RD_IDLE=0`) | **no panic**, no data |
+| Full (ATOM+SMC) + GART (earlier sessions) | reads leave chip with garbage ≥4 GB addr | **panic** `apciec 0x200000` |
+| Interrupted ATOM (this session) | unknown — aborted mid-training | **panic loop** |
+
+The minimal path (`boot_sdma_minimal`, `AMD_BOOT_SDMA_ATOM=0`) is safe-ish (no panic)
+but useless: SDMA wedges on its first ring fetch because the MC-hub/BIF outbound
+system-read path was never initialized (that init lives in ATOM `asic_init` and/or
+SMC/MC fw — see Linux `gmc_v8_0_gart_enable` + `vi_common_init`).
+
+The **correct next attempt** (once recovered from the reboot loop):
+```
+# after enclosure power-cycle OR immediate --reset
+AMD_BOOT_SDMA_PROBE=1 AMD_BOOT_SDMA_AGP=0 AMD_BOOT_GART_SYSMEM=1 \
+  python3 add.py --boot-stage=sdma-probe
+```
+This runs: full ATOM asic_init (default jump budget) → apertures + 64-bit GART PTEs
+→ SDMA-only ucode (halted until ring programmed) → one `WRITE_LINEAR` proof.
+Still **no SMC, no MEC** — smallest path that can actually complete a host read.
+
+### Panic signature (unchanged across all sessions)
+
+`apciec[pcic0-bridge] unhandled interrupts (0x200000 out of 0x220000)` =
+Apple T8103 root port, interrupt bit 21 = **device→host request address ≥ 32 bits**.
+Fires when the GPU emits a TLP at a garbage MC address. Our GART PTEs now emit
+verified <4 GB IOVAs; the remaining panics are stale-engine junk or mid-init state.
+
+### Code fixes already landed (do not roll back)
+
+- 64-bit GART PTEs + physical page-table base + `PTE_REQUEST_PHYSICAL` (session #9)
+- SDMA ring teardown before halt/unhalt (panic #7)
+- SDMA-only fw upload without touching live MEC (panic #7)
+- AGP aperture path + `boot_sdma_minimal()` (session #10)
+- `mc_setup_tlb_apertures()` matching Linux `gmc_v8_0_gart_enable` field-exact
+- `sdma_soft_reset()` auto-cleanup on wedged MC read (engine recovers to IDLE=1)
+- `AMD_BOOT_SDMA_ATOM` gate (default 0 = skip ATOM; use 1 for the real attempt)
+
+
+## Session #11 — bit 21 decoded: **"Request address is greater than 32 bits"**
+
+Public T8103 panic reports (StackOverflow "MacOS kext panic Request address is greater
+than 32 bits") show the *handled* version of our exact interrupt:
+
+```
+apciec[pcic1-bridge]::handleInterrupt: Request address is greater than 32 bits
+linksts=0x99000001 pcielint=0x00220000 ... @AppleT8103PCIeCPort.cpp:1301
+```
+
+Same port interrupt mask `0x220000`; bit 21 (`0x200000`) = **inbound (device→host)
+request whose bus address exceeds 32 bits**. On newer macOS the eGPU port has no
+handler registered for it → `"unhandled interrupts (0x200000 out of 0x220000)"` panic.
+Apple Silicon gives each PCIe device a DART; TinyGPU's `PrepareDMA` hands back small
+32-bit IOVAs (`0x4000`, `0x88000`, …). So the panic fires whenever the GPU emits a TLP
+with a **garbage / ≥4 GB address** — not on every DMA:
+
+- Malformed GART walk (4-byte PTEs, VA root) → walker TLPs at garbage 64-bit addresses
+  → panic (#5–#8). The 64-bit-PTE fix (session #9) attacks exactly this.
+- Stale/uninitialized engine state (EOP/MQD/ring bases are 64-bit regs full of junk)
+  → spontaneous panics with zero host activity.
+- Correct 32-bit IOVA DMA (NV path) does NOT panic — consistent.
+
+**Rules going forward:** every address the device can ever emit must be a <4 GB IOVA
+from `PrepareDMA`; never unhalt an engine whose base/rptr/wptr addresses aren't
+programmed; quiesce rings before halt/unhalt (already done for SDMA).
+
+Also: `--boot-stage=sdma-probe` cold path can now skip the ATOM replay
+(`AMD_BOOT_SDMA_ATOM=0`) — SDMA + AGP-to-host needs no VRAM training, and the ATOM
+replay is minutes of MMIO with its own crash history. Order of first HW attempt:
+`AMD_BOOT_SDMA_PROBE=1 AMD_BOOT_SDMA_ATOM=0 add.py --boot-stage=sdma-probe`
+(no ATOM, no SMC, no MEC, AGP addressing, one WRITE_LINEAR).
+
+### Session #11 results — first sdma-probe runs that DON'T panic
+
+Ran the minimal probe (no ATOM, no SMC, no MEC) on hardware. **No kernel panic** —
+first time an SDMA unhalt + ring fetch attempt did not kill the machine. But no data
+either; the engine wedges on its first MC read:
+
+| run | result |
+|-----|--------|
+| AGP mode, VBIOS-default `MC_VM_MX_L1_TLB_CNTL=0x503` | `rptr=0`, `STATUS=0x4496e446` — `IDLE=0`, `MC_RD_IDLE=0` (fetch read stuck in-flight) |
+| AGP mode + `mc_setup_tlb_apertures()` (L1 TLB on, SYSTEM_ACCESS_MODE=3, ADV_MODEL on — gmc_v8_0_gart_enable values) | same stall |
+| GART mode (64-bit PTEs verified by CPU: `pte=0x88077 == expected`) | same stall |
+
+`sdma_soft_reset()` (SRBM bits, sdma_v3_0_soft_reset) recovers the engine to
+`IDLE=1` every time — added to the probe as automatic cleanup, since a wedged
+in-flight read is a prime suspect for the "spontaneous" delayed panics.
+
+**Interpretation:** with the minimal (ATOM-skipped) boot, the device→host read never
+leaves the chip / never completes — no panic, no data, engine stuck. In earlier FULL
+boots (ATOM+SMC+MC) the reads clearly DID leave the chip (they panicked the root port
+with garbage addresses). So the MC-hub/BIF path for outbound system reads needs some
+init that only the ATOM asic_init (or SMC/MC fw) performs. Next: keep the GART-mode
+probe (every emitted address is a CPU-verified <4 GB IOVA → cannot trip bit 21) but
+run the ATOM replay first (`AMD_BOOT_SDMA_ATOM=1`), still no SMC / no MEC.
+
+**01:21:38 panic (delayed again):** same `apciec 0x200000`, ~11 min after the last
+probe — even though both probe runs ended with `sdma_soft_reset()` and a verified
+`IDLE=1`. So the SRBM soft reset does not cancel whatever transaction is latched in
+the MC hub / BIF, or the delayed panic has a different source entirely (macOS
+periodically touching the stale device is one candidate — the un-posted GPU is
+enumerated but half-dead). The wedged-read cleanup stays (it's correct per
+sdma_v3_0_soft_reset), but it is demonstrably NOT sufficient to stop the delayed
+panics. Conclusion stands: **only a boot state in which the GPU can actually
+complete host reads is safe to leave on the link.**
+
+Also fixed while reading gmc_v8_0_gart_enable line-by-line: our
+`_gart_program_vm` wrote `MC_VM_MX_L1_TLB_CNTL=0x98000b` (SYSTEM_ACCESS_MODE=1, no
+ENABLE_ADVANCED_DRIVER_MODEL). Linux uses MODE=3 (not-in-sys) + ADV_MODEL=1 —
+without ADV_MODEL the VM/aperture path is not fully active on gfx8. Now programmed
+field-by-field exactly like Linux (`mc_setup_tlb_apertures()`), shared by the GART
+and AGP paths.
+
+### Panic timeline update (01:28 / 01:35) — half-initialized GPU is itself a panic source
+
+- **01:28:15**: panic ~30 s after the reboot from the 01:21 panic, with **zero** host
+  commands — macOS re-enumerated the stale, half-dead eGPU (unified log shows apciec
+  bridge enumeration + DART SID mapping right around it) and the root port tripped.
+- **01:32**: AGP-mode sdma-probe (no ATOM) ran with **no panic** — engine wedged on
+  the fetch again (`IDLE=0, MC_RD_IDLE=0`), auto `sdma_soft_reset()` → `IDLE=1`.
+- **~01:33**: sdma-probe with `AMD_BOOT_SDMA_ATOM=1` — ATOM replay aborted mid-table
+  (`ATOM jump loop stuck op=73 iters=512`): `AMD_ATOM_JUMP_MAX=512` was too small; a
+  training/poll loop needed more. Training DID progress: `MISC0 0x0 → 0x50609162`.
+- **01:35:07**: panic again — GPU left **mid-asic_init** (worse than stale).
+
+Lesson: an interrupted ATOM replay leaves the most dangerous state of all. Never
+abort it with a tight iteration cap; use the default budget and let it finish.
+
+- **01:41:49**: panic ~20 s after a read-only `--probe`. The mid-asic_init GPU state
+  **persists across host reboots** (enclosure keeps the card powered), so every new
+  macOS boot re-enumerates the same broken device and panics within seconds-to-minutes
+  of any contact — a reboot loop. Recovery plan: `--reset` (vi_asic_pci_config_reset
+  via cfg 0x7c) to return the ASIC to power-on defaults, then a **complete** ATOM
+  asic_init with the default jump budget (no `AMD_ATOM_JUMP_MAX` cap), then the GART
+  sdma-probe. If `--reset` cannot stop the spontaneous panics, the eGPU enclosure
+  needs a physical power-cycle before the next attempt.
+
+## Session #10 — read the panic logs; FB-aperture collision hypothesis
+
+Read `/Library/Logs/DiagnosticReports/panic-full-*.panic`. **Every** panic (23:57, 00:04,
+00:09, 00:16) is byte-identical:
+
+```
+panic(...): "apciec[pcic0-bridge] unhandled interrupts (0x200000 out of 0x220000)" @APCIECPort.cpp:2056
+T8103 / AppleT8103PCIeC (USB4 root port); triggering task around TinyGPU
+```
+
+Bit `0x200000` (bit 21) is the Apple T8103 PCIe **root-port error interrupt** on a
+device-initiated transaction it can't service; the port enables `0x220000` and has no
+handler for `0x200000` → panic. Masking the **GPU's** MSI/INTx + IH/CP interrupts does
+not help — it's the **bridge** reacting to an outbound (GPU→host) TLP, not a GPU IRQ.
+
+**Key facts that narrow it down:**
+
+- DeepWiki (tinygrad) confirms `MAP_SYSMEM_FD` returns the **device DMA addresses** from
+  `IODMACommand::PrepareForDMA` — correct to program directly. So addressing *values* are right.
+- The **NV** eGPU path DMAs host memory over this same TinyGPU/USB4 transport **without**
+  this panic → device→host DMA is NOT fundamentally broken here.
+- `gart-probe` (CPU-only PTE build, **no** SMC, **no** engine, **no** device DMA) never panics.
+- Panics only appear once we (a) `start_smc` in a full boot, (b) unhalt an engine, or
+  (c) let an engine do its first host read.
+
+**New root-cause hypothesis — FB-aperture collision on the page-table walk.** GCN routes
+an MC address to local VRAM when it falls inside the framebuffer aperture. We set
+`FB_LOCATION` to `vram_start=0 .. vram_end=0xFFFFFFFF` (4 GB). The DMA addresses TinyGPU
+hands back are **small** (`0x4000`, `0x88000`, `0x114000`) — i.e. **inside** `[0, 4 GB)`.
+With `PTE_REQUEST_PHYSICAL=1`, the page-table **walker** reads the PTE at that small
+physical address, which the MC routes to **VRAM**, not PCIe → it gets garbage → the data
+access goes to a bogus address → the root port times out → `0x200000`. (Data pages carry
+the PTE `SYSTEM` bit so they'd route to PCIe, but the *walk itself* does not.)
+
+**Fix direction (this session): avoid the page-table walk entirely — use the AGP aperture.**
+`amdgpu_gmc_agp_addr` maps a linear MC window `agp_start + dma_addr` straight to system
+memory with **no page table**. `agp_start = 4 GB` (above the FB aperture), so AGP MC
+addresses route to PCIe/host by construction. Program the SDMA ring base + dst as AGP MC
+addresses → the only device transactions are (1) ring fetch read and (2) WRITE_LINEAR —
+both routed to host via AGP, no walk, no FB collision.
+
+Also: the SDMA proof no longer starts the **SMC** (unneeded — ucode is uploaded by MMIO;
+SMC boot is an extra DMA/crash surface) and never touches RLC/CP/MEC.
+
+**Code added:**
+
+- `boot_sdma_minimal()` — ATOM → `mc_program` (FB/AGP/system apertures) → GART/AGP →
+  SDMA-only fw (halted). No SMC, no RLC/CP/MEC.
+- `probe_sdma_dma(use_agp)` — `AMD_BOOT_SDMA_AGP=1` (default): ring + dst via
+  `agp_mc_addr(paddr)`, no GART page-table dependency.
+- `sdma-probe` stage: cold GPU → `boot_sdma_minimal`; hot GPU → SDMA-only upload, no MEC.
+
+Prior 64-bit-PTE + physical-base + ring-teardown fixes stay (correct for the GART path;
+still needed if AGP is disabled).
+
+## Session #9 — GART page table was malformed (still-valid fix)
+
+Found the real reason **every** GPU→host DMA read panicked (KCQ #6, SDMA #7/#8, chained #5):
+our GART page table was **wrong on two counts**, so the MC's very first page-table walk
+read a bogus host address → `apciec 0x200000` completion timeout → macOS reboot.
+
+| Bug | Was | Correct (gfx8 / `gmc_v8_0_gart_enable`) |
+|-----|-----|------------------------------------------|
+| **PTE width** | 4-byte entries, 4-byte stride | **8-byte (64-bit) PTEs** — `amdgpu_gmc_set_pte_pde` writes 64-bit; a 4-byte table means the walker reads every entry at the wrong offset |
+| **Page-table base** | `PAGE_TABLE_BASE_ADDR = gart_start` (a GART **VA**, self-mapped) | **physical DMA address** of the PTE table — the root pointer is dereferenced by the MC directly, not through the table |
+| **L2 request mode** | `VM_L2_CNTL4 = 0` | **PDE/PTE_REQUEST_PHYSICAL = 1** (ctx0+ctx1) so the walker reads the table + PTEs from **host RAM** (`/* enable PTE/PDE in system memory */`) |
+
+Confirmed PTE size = 8 bytes and the physical-request requirement via DeepWiki
+(`torvalds/linux` gmc_v8) and `ref/linux/.../gmc_v8_0.c:865-883`.
+
+**Fix applied (`polaris_boot.py`):**
+
+- `GART_PTE_SIZE=8`, `GART_PTE_ADDR_MASK` (`[47:12]`), `_encode_pte()` builds 64-bit PTEs.
+- `gart_enable` (sysmem): 8-byte table sized `gart_size/4K * 8` (512 KB / 256 MB aperture),
+  **contiguous** host alloc (walker needs `base_phys + off`), base = `paddrs[0]`,
+  `_gart_program_vm(..., pte_physical=True)`.
+- `_gart_program_vm`: sets `VM_L2_CNTL4` ctx0+ctx1 PDE/PTE_REQUEST_PHYSICAL when physical.
+- `_gart_write_pte` / `map_sysmem_gpu` / `probe_gart_dma`: 8-byte stride + `<Q>` packing.
+- `_paddrs_contiguous()` guard on the table alloc.
+
+**Verified on HW (CPU-side, no device DMA, no panic):**
+
+```
+polaris: GART PTE table in host RAM base_phys=0x4000 entries=65536 bytes=0x80000
+gart_probe pte_ok=True src_va=0xff00100000 paddr=0x88000 pte=0x88077 expected=0x88077
+```
+
+**Also this session:** `sdma-probe` cold path is now **SDMA-only (no RLC/CP/MEC upload,
+no ME1 unhalt)** — SDMA is independent of the graphics pipe, so a pure DMA proof no
+longer needs the whole compute bring-up (smaller crash surface).
+
+**Crash note:** the staged run got cleanly through `fw-mec` → `fw-start` (ME1 live,
+`CP_MEC_CNTL=0x10000000`, printed and exited 0) then the machine rebooted shortly after
+— consistent with the known residual risk of leaving **ME1 unhalted** on USB4. The new
+SDMA-only `sdma-probe` avoids ME1 entirely; that is the next HW test.
+
+**Next HW test (cold, single shell, self-contained):**
+
+```
+AMD_BOOT_VBIOS_FILE=/tmp/rx570.rom AMD_BOOT_SDMA_PROBE=1 python3 add.py --boot-stage=sdma-probe
+```
+
+boots ATOM→SMC→MC→GART(64-bit phys table)→SDMA-only(halted)→ring in GART→unhalt SDMA→
+WRITE_LINEAR→poll dst. If the PTE fix is right, `write_ok=True` with no panic — the first
+proven device→host DMA on this stack.
+
+### Linux amdgpu SDMA read (ref/linux `sdma_v3_0.c`, `gmc_v8_0.c`) — audited 2026-07-09 ~00:10
+
+Confirmed our path now matches Linux for a host-memory ring:
+
+| Detail | Linux | Ours |
+|--------|-------|------|
+| GART PTE size | 8 bytes (`amdgpu_gmc_set_pte_pde`) | ✅ 8-byte |
+| PTE encode | `paddr[47:12] \| flags(0x77)` | ✅ `_encode_pte` |
+| Page-table base | `PAGE_TABLE_BASE_ADDR = table_paddr>>12` (phys) | ✅ `gart_pte_phys` |
+| Host-mem walk | `VM_L2_CNTL4` PDE/PTE_REQUEST_PHYSICAL=1 | ✅ ctx0+ctx1 set |
+| ctx0 depth | flat, `PAGE_TABLE_DEPTH=0` | ✅ `VM_CONTEXT0_CNTL=0x11` |
+| Ring base | `RB_BASE = gpu_addr>>8`, `RB_BASE_HI = gpu_addr>>40` | ✅ |
+| wptr (no doorbell) | `WREG32(SDMA0_GFX_RB_WPTR, wptr<<2)` | ✅ `_sdma_gfx_ring_commit` |
+| Order | `enable(false)`(gfx_stop+HALT) → program RB while halted → `RB_ENABLE=1` → `enable(true)` | ✅ `sdma_enable(False)` → `_sdma_gfx_ring_setup` → unhalt at end |
+| Ring test pkt | 5-dw WRITE_LINEAR, `COUNT(1)`, `0xDEADBEEF` | ✅ |
+
+tinygrad `AMDev` (DeepWiki) confirms the same model: ring lives in a GPUVM VA; the page
+table is in **host memory**; `VM_CONTEXT0_PAGE_TABLE_BASE_ADDR` = **physical** address of
+the root table (no framebuffer/AGP offset). So the design is correct; the only open
+question is whether M1/USB4 can service the device→host **read** of the table+ring.
+
+Extra hardening in `_sdma_gfx_ring_setup`: clear `RPTR_WRITEBACK_ENABLE`, zero
+`RB_RPTR_ADDR`, disable `RB_WPTR_POLL_CNTL` and `SDMA0_GFX_DOORBELL` so the *only*
+engine-initiated device DMA is the ring fetch itself (rptr writeback / wptr poll would
+each add another host access that could independently time out).
+
+### Bug fixed (2026-07-08 ~23:57): cold `sdma-probe` reached `gart_probe pte_ok=True`
+(64-bit table accepted) then raised `SDMA ucode not resident` — `load_ip_firmware_direct`
+uploaded SDMA but never set `_sdma_fw_resident`, so `probe_sdma_dma()` bailed **before**
+the WRITE_LINEAR. Now set on the direct path too. GPU came back cold after (USB4 re-enum);
+next run reaches the actual device DMA.
+
+**Hardened SDMA ring setup (2026-07-09 ~00:05):** `_sdma_gfx_ring_setup` now disables
+every *engine-initiated* device DMA so the probe's only device→host access is the ring
+fetch itself: cleared `RPTR_WRITEBACK_ENABLE` (else the engine DMA-writes the rptr report
+to host), zeroed `RB_RPTR_ADDR_HI/LO`, disabled `RB_WPTR_POLL_CNTL.ENABLE` (else it
+DMA-reads a host wptr shadow) and `GFX_DOORBELL.ENABLE`. This isolates the one read we
+actually want to prove.
+
+**Prior line:** 2026-07-08 ~23:28 — `fw-sdma` FIXED (no panic); panic #8 at `sdma-probe` ring fetch
+
+## Session #8 — `fw-sdma` fixed; panic #8 is the SDMA ring fetch itself (2026-07-08 ~23:28)
+
+**`fw-sdma` no longer panics.** The code fix from Session #7 works on a **hot GPU**
+(`CP_MEC_CNTL=0x10000000`, ME1 live, SMC up):
+
+```
+atom → fw-mec (0x50000000) → fw-start (0x10000000) → fw-sdma
+stage=fw-sdma sdma_only=True unhalt=False CP_MEC_CNTL=0x10000000 F32_CNTL=0x1
+  polaris: SDMA-only firmware loaded (polaris10_sdma.bin, polaris10_sdma1.bin)
+```
+
+- **SDMA-only upload** (2×3109 words, ~1s) — MEC never re-halted/re-uploaded.
+- SDMA left **halted** (`F32_CNTL=0x1`), GFX rings torn down (`RB_ENABLE=0`, `RB_BASE=0`).
+- No kernel panic. This is exactly the incremental, safe path the Session #7 fix planned.
+
+**Then `AMD_BOOT_SDMA_PROBE=1 sdma-probe` kernel-panicked (panic #8).** This is the
+`_sdma_gfx_ring_setup` → `sdma_enable(True)` → WRITE_LINEAR path: the moment the SDMA
+F32 is unhalted **with `RB_ENABLE=1` pointing at a GART-sysmem ring**, the engine
+DMA-reads that ring from host memory over USB4 → `apciec 0x200000` completion timeout.
+
+**Conclusion — the wall is device→host DMA *read*, not firmware upload.**
+`fw-sdma` (all MMIO, no DMA) is safe. `sdma-probe` fails at the **first ring fetch**,
+i.e. the GPU reading the RB from a host physical address. This matches every prior
+panic (KCQ MQD preload #6, chained boot #5): **any GPU→host read over M1/USB4 times
+out at the bridge.** CPU-side checks (`gart-probe` PTE self-map) pass because they
+never involve a device read.
+
+**New hypothesis (addressing, not transport):** on Apple Silicon a PCIe device behind
+the USB4 **DART** sees *IOVA*, not host physical addresses. If `MAP_SYSMEM` hands us
+host paddrs but the GART PTEs / ring base must carry **DART-translated IOVAs** for the
+GPU to reach host RAM, every ring fetch lands on an unmapped DART address → completion
+timeout → panic. Next work is in code/transport (verify the DMA address domain), **not**
+another blind `sdma-probe` (it reboots the machine).
+
+**Fix applied this session (code):**
+
+| Change | File | What |
+|--------|------|------|
+| `_sdma_gfx_ring_disable(off)` | `polaris_boot.py` | Mirror `sdma_v3_0_gfx_stop`: clear `RB_ENABLE`+`IB_ENABLE`, zero `RB_BASE`/`RB_BASE_HI`/`RPTR`/`WPTR`, per instance |
+| `sdma_enable(False)` | `polaris_boot.py` | gfx-stop **both** instances before F32 HALT (so next unhalt can't fetch stale `RB_BASE`) |
+| `load_sdma_firmware_only(unhalt=False)` | `polaris_boot.py` | SDMA-only MMIO upload; never touches live CP/MEC (fixes panic #7 hot re-upload) |
+| `sdma_fw_resident()` | `polaris_boot.py` | Track ucode residency separate from unhalt state |
+| `probe_sdma_dma()` | `polaris_boot.py` | No longer requires pre-unhalt; ring setup unhalts only after `RB_BASE` is a valid GART VA |
+| `fw-sdma` stage | `add.py` | Hot GPU → `load_sdma_firmware_only`; default `unhalt=False` |
+| `sdma-probe` stage | `add.py` | Hot GPU → GART + SDMA-only upload (halted), never re-boot MEC |
+
+**Status:** `fw-sdma` = ✅ safe now. `sdma-probe` = ❌ **panic #8 (ring fetch)** — the
+device→host DMA read wall. Investigate DART/IOVA addressing before re-running.
+
+**Prior line:** 2026-07-08 ~23:10 — APCIE panic #7 during `fw-sdma` (never reached `sdma-probe`)
+
+## Session #7 — `fw-sdma` panic before `sdma-probe` (2026-07-08 ~23:08)
+
+Attempted staged DMA proof: `fw-sdma` → `AMD_BOOT_SDMA_PROBE=1 sdma-probe`.
+
+**Pre-crash state** (`--probe` immediately before):
+
+```
+pci=1002:67df  CP_MEC_CNTL=0x10000000 (ME1 already running)
+SMC running=True  CONFIG_MEMSIZE=0x1000 (trained)
+```
+
+GPU was **hot** from an earlier session (`fw-start` / `kiq`), not cold.
+
+**What ran:** `python3 add.py --boot-stage=fw-sdma`
+
+- Calls `boot_through_fw_direct(FW_COMPUTE_MIN | SDMA0 | SDMA1)` with **`unhalt=True`**
+  (default `AMD_BOOT_FW_UNHALT=1`).
+- Full re-bootstrap on a live GPU: ATOM → SMC → MC → GART → **halt running MEC** →
+  re-upload RLC + PFP + CE + ME + **MEC** + SDMA0 + SDMA1 (~200 s MMIO) → unhalt CP + MEC +
+  **SDMA F32**.
+- Process killed @~200 s — **macOS kernel panic / reboot** (no stage output captured).
+- **`sdma-probe` never ran.**
+
+**Root cause (same APCIE class as panic #6, new trigger):**
+
+| Factor | Problem |
+|--------|---------|
+| **Hot re-upload** | `fw-sdma` is not incremental — it halts a **live ME1** and re-streams the entire compute firmware blob on USB4. High MMIO volume + mid-session MEC halt is fragile. |
+| **SDMA unhalt without ring teardown** | Linux `sdma_v2_4_gfx_stop` clears `RB_ENABLE` + `IB_ENABLE` **before** F32 halt. Our `load_ip_firmware_direct` only sets `F32_CNTL.HALT`; stale `RB_BASE` / `RB_ENABLE` may survive. Unhalting SDMA (`sdma_enable(True)`) can make F32 **immediately DMA-read a garbage ring address** → device→host read → `apciec 0x200000` panic. |
+| **Wrong prerequisite path** | `sdma-probe` needs SDMA ucode resident, but `fw-sdma` as written is a full fw re-bootstrap, not “upload SDMA bins only, stay safe.” |
+
+**Not the failure mode we intended to test:** we never reached the gated `sdma-probe`
+WRITE_LINEAR experiment. The crash is at SDMA **firmware upload + unhalt**, not at the
+deliberate ring-commit path in `probe_sdma_dma()`.
+
+**Fix needed (code, not yet applied):**
+
+1. `fw-sdma` on hot GPU: **SDMA-only upload** if MEC already running (`skip_fw` pattern);
+   do not re-halt/re-upload MEC.
+2. Before any SDMA halt/unhalt: call `_sdma_gfx_ring_disable()` (mirror
+   `sdma_v2_4_gfx_stop`) — clear `RB_ENABLE`, `IB_ENABLE`, zero `RB_BASE`.
+3. Default `fw-sdma` to **`unhalt=False`**; let `sdma-probe` unhalt only after ring is
+   mapped in GART.
+4. Or fold SDMA upload into `sdma-probe` itself with `unhalt=False` upload + controlled
+   ring setup + single unhalt at the end.
+
+**Current blocker:** cannot run `sdma-probe` until SDMA fw can be loaded **without panic**.
+Until then, KCQ activation (`AMD_BOOT_KCQ_ACTIVATE=1`) and vector-add remain blocked.
 
 ## Session #6 — panic root cause + fix (2026-07-08 ~22:40)
 
@@ -27,12 +438,11 @@ longer crash. Activation requires an explicit opt-in (`AMD_BOOT_KCQ_ACTIVATE=1`,
 already-gated `AMD_BOOT_RING_TEST=1` / `AMD_BOOT_ADD=1` / `AMD_BOOT_FULL=1`). Verified on HW:
 `kiq` runs to completion, `KIQ_HQD_ACTIVE=0x1`, `KCQ_HQD_ACTIVE=0x0`, no panic.
 
-**Still blocked (unchanged):** the actual vector-add needs a live KCQ, which needs proven
-device→host DMA. Until a posted-write-safe DMA proof exists, activating the KCQ will DMA host
-sysmem and can panic — hence the gate. Next real experiment must be a minimal device-DMA proof,
-not a compute dispatch.
+**Still blocked:** vector-add needs a live KCQ → needs proven device→host DMA → needs
+`sdma-probe` → needs SDMA fw loaded safely. **Panic #7 showed `fw-sdma` itself is unsafe**
+on a hot GPU; fix SDMA upload path before retrying.
 
-**Prior line:** 2026-07-08 ~22:03 — APCIE panic #5; session stopped at `fw-mec`
+**Prior line:** 2026-07-08 ~22:40 — panic #6 KCQ activation gated; `kiq` safe
 
 ## Status
 
@@ -43,18 +453,50 @@ not a compute dispatch.
 | **Solved** | Staged fw upload: `atom` → `fw-mec` completes without panic (~32s total) |
 | **Solved** | SRBM / KCQ direct / GART PTE — verified in **earlier** sessions (not re-validated this reboot) |
 | **Blocker** | **CP rings never drain** — `PQ_RPTR=0x0`; `SCRATCH` stuck at `0xCAFEDEAD` (earlier `kcq-ring-test`) |
-| **Blocker** | **GPU-side GART DMA unproven** — CPU `pte_ok=True` ≠ device can read `0xff00…` sysmem |
-| **Fixed** | **macOS USB4 APCIE MSI panic** — device IRQs now masked (PCI MSI/INTx + GPU IH/CP interrupt block) before firmware runs; see *Fix: interrupt masking* below |
-| **Session #5** | **Crashed during `fw-start`→`gart-probe`→`kcq-direct` chain** — only `atom`+`fw-mec` completed (pre interrupt-mask fix) |
-| **Current stage** | Interrupt-mask fix landed — device IRQs masked before firmware runs; re-run staged boot to verify no panic |
-| **Next** | Replug → `fw-start` alone → `gart-probe` alone → `kcq-direct` alone → `AMD_BOOT_RING_TEST=1 kcq-ring-test` (panic trigger now removed) |
-| **Safe (this session)** | `--probe`, `--selftest`, `atom`, `fw-mec` (upload only, MEC stays halted) |
-| **Risky** | `fw-start` (unhalt MEC), `gart-probe`, `kcq-direct`, anything with ring dispatch |
-| **Gated** | `kiq-map`, `kcq-ring-test` (`AMD_BOOT_RING_TEST=1`), `add` (`AMD_BOOT_ADD=1`), `AMD_BOOT_FULL=1` |
+| **Blocker** | **GPU-side GART DMA unproven** — `sdma-probe` never ran; blocked by unsafe `fw-sdma` |
+| **Blocker** | **`fw-sdma` panics on hot GPU** — full MEC re-upload + SDMA unhalt without `RB_ENABLE` teardown (panic #7) |
+| **Fixed** | **KCQ HQD activation gated** — `kiq` safe (`KIQ=1`, `KCQ=0`); panic #6 root-caused |
+| **Fixed** | **macOS USB4 APCIE MSI panic (IRQ path)** — interrupt mask before unhalt; does not fix DMA completion timeout |
+| **Session #7** | **`fw-sdma` panic @~200s** on hot GPU (`CP_MEC_CNTL=0x10000000`); `sdma-probe` not reached |
+| **Furthest safe point** | After replug: `atom` → `fw-mec` → `fw-start` → `kiq` (no KCQ activation) |
+| **Next (code)** | Fix `fw-sdma`: SDMA-only incremental upload, `sdma_v2_4_gfx_stop` before halt, `unhalt=False` default |
+| **Next (HW)** | Only after fix: `AMD_BOOT_SDMA_PROBE=1 sdma-probe` → then consider `AMD_BOOT_KCQ_ACTIVATE=1` |
+| **Safe** | `--probe`, `--selftest`, `atom`, `fw-mec` (MEC halted), `kiq` (KCQ staged only) |
+| **Unsafe** | **`fw-sdma` on hot GPU** (proven panic #7), `AMD_BOOT_KCQ_ACTIVATE=1`, chained stages |
+| **Gated** | `sdma-probe`, `kcq-ring-test`, `add`, `AMD_BOOT_FULL=1` |
 
 ---
 
-## Current stage & blocker (2026-07-08 ~22:03)
+## Current stage & blocker (2026-07-08 ~23:10)
+
+### Session #7 — `fw-sdma` panic (sdma-probe prerequisite failed)
+
+| Step | Command | Result |
+|------|---------|--------|
+| 1 | `--probe` | `pci=1002:67df` `CP_MEC_CNTL=0x10000000` ME1 hot, trained |
+| 2 | `--boot-stage=fw-sdma` | **kernel panic @~200s** — no output |
+| 3 | `AMD_BOOT_SDMA_PROBE=1 sdma-probe` | **not reached** |
+
+```
+atom → fw-mec → fw-start → kiq  →  fw-sdma  →  sdma-probe  →  KCQ activate  →  add
+ ✓       ✓        ✓       ✓          ✗            ✗               ✗            ✗
+                              ↑ panic #7 (hot re-upload + SDMA unhalt)
+```
+
+**Unified APCIE panic mechanism (sessions #5–#7):**
+
+Any operation that makes the GPU **DMA-read host sysmem** over M1/USB4 can trigger
+`apciec unhandled interrupts (0x200000)` — completion timeout on the bridge, not GPU MSI.
+Known triggers:
+
+| Trigger | Session |
+|---------|---------|
+| KCQ HQD `PRELOAD_REQ` + `CP_HQD_ACTIVE` | #6 (fixed — gated) |
+| SDMA F32 unhalt with stale `RB_ENABLE` / garbage `RB_BASE` | **#7** |
+| SDMA ring commit / MEC ring fetch (untested) | pending `sdma-probe` |
+| Chained `fw-start → gart → kcq` on hot GPU | #5 |
+
+Interrupt masking fixes the **IRQ** path only; it does **not** fix DMA completion timeout.
 
 ### Session #5 — panic during chained boot
 
@@ -332,13 +774,19 @@ sleep 10
 # 7. GART PTE self-map — RUN ALONE
 python3 add.py --boot-stage=gart-probe
 
-# 8. KCQ direct HQD — RUN ALONE
+# 8. SDMA fw — **UNSAFE on hot GPU until code fix (panic #7)**
+#    Need: SDMA-only upload, RB_ENABLE cleared, unhalt=False until sdma-probe sets ring
+# python3 add.py --boot-stage=fw-sdma
+# sleep 10
+# AMD_BOOT_SDMA_PROBE=1 python3 add.py --boot-stage=sdma-probe
+
+# 9. KCQ direct HQD — RUN ALONE (activation gated unless AMD_BOOT_KCQ_ACTIVATE=1)
 python3 add.py --boot-stage=kcq-direct
 
-# 9. KCQ ring test — gated; MMIO wptr only on darwin
+# 10. KCQ ring test — gated; MMIO wptr only on darwin
 AMD_BOOT_RING_TEST=1 python3 add.py --boot-stage=kcq-ring-test
 
-# 10. Vector-add — only after ring_ok=True
+# 11. Vector-add — only after ring_ok=True and sdma-probe write_ok=True
 AMD_BOOT_ADD=1 python3 add.py --boot-stage=add
 
 # DO NOT chain: fw-start && gart-probe && kcq-direct  (caused panic #5)
@@ -366,8 +814,10 @@ Still run one stage per shell and respect settle timing until verified on HW.
 | `--boot-stage=fw-direct` | ⚠️ high MMIO volume |
 | `--boot-stage=fw-mec` | ⚠️ medium | ~30s MMIO; MEC stays halted — **safe endpoint this session** |
 | `--boot-stage=fw-start` | ⚠️ **high** | MEC unhalt — may trigger APCIE MSI (panic #5 suspect) |
-| `--boot-stage=gart-probe` | ⚠️ medium | GART PTE setup |
-| `--boot-stage=kcq-direct` | ⚠️ **high** | KIQ+KCQ HQD commit |
+| `--boot-stage=gart-probe` | ⚠️ medium | GART PTE setup (CPU-only) |
+| `--boot-stage=fw-sdma` | ❌ **unsafe on hot GPU** | Panic #7 — full MEC re-upload + SDMA unhalt w/o ring teardown |
+| `--boot-stage=sdma-probe` | ❌ **blocked** | Needs safe SDMA upload first; then `AMD_BOOT_SDMA_PROBE=1` |
+| `--boot-stage=kcq-direct` | ⚠️ medium | KIQ+staged KCQ (activation gated) |
 | `--boot-stage=kcq-ring-test` | ❌ **gated** — `AMD_BOOT_RING_TEST=1`; caused APCIE panic with doorbell |
 | `--boot-stage=add` | ❌ **gated** — `AMD_BOOT_ADD=1` |
 | **`add.py` default** | ❌ **blocked** — requires `AMD_BOOT_FULL=1` |
@@ -446,16 +896,16 @@ Default `add.py` now: ATOM train → SMC boot → **skip LoadUcodes** → comput
 
 ## Next steps (ordered)
 
-1. **Replug eGPU** — `--probe` must show `pci=1002:67df`.
-2. **`atom`** then **`fw-mec`** — confirmed safe this session (~32s total).
-3. **`fw-start` alone** — wait 10s; note if panic happens here (isolates MEC unhalt).
-4. **`gart-probe` alone** — CPU PTE check only.
-5. **`kcq-direct` alone** — HQD commit; expect `KCQ=1`.
-6. **`AMD_BOOT_RING_TEST=1 kcq-ring-test`** — only if step 5 survives; watch `SCRATCH`.
-7. If ring stuck → **SDMA GPU readback** from GART VA before any more dispatch attempts.
-8. **Never chain stages** in one shell command on USB4.
+1. **Replug eGPU** after panic — `--probe` must show `pci=1002:67df`.
+2. **Code fix `fw-sdma`** before any more SDMA experiments (see Session #7).
+3. Cold path only until fix: `atom` → `fw-mec` → `fw-start` → `kiq` (each alone, sleep 10s).
+4. **Do not run `fw-sdma` on hot GPU** — proven panic #7.
+5. After fix: `AMD_BOOT_SDMA_PROBE=1 sdma-probe` — the real DMA proof.
+6. Only if `sdma-probe write_ok=True`: consider `AMD_BOOT_KCQ_ACTIVATE=1`.
+7. **Never chain stages** in one shell command on USB4.
 
-Open question: panic #5 hit during chained `fw-start→gart→kcq` — is **`fw-start` unhalt** the trigger, or **`kcq-direct` HQD setup**?
+Open question: is M1/USB4 device→host DMA broken entirely, or only when ring addresses
+are wrong? Cannot answer until `fw-sdma` is fixed enough to reach `sdma-probe`.
 
 ---
 
@@ -521,13 +971,16 @@ vi_common_init → enable_vbios_rom → ATOM asic_init
 - [x] `kiq-map` with `skip_fw` — fast, no kernel panic (KCQ still inactive)
 - [x] GART PTE flush + `gart-probe` + KCQ direct fallback (code; HW pending)
 - [x] MMIO drain (`AMD_MMIO_DRAIN_EVERY`)
+- [x] KCQ activation gate (`boot_allow_hqd_activation`) — panic #6 fixed
+- [x] `sdma-probe` code path (WRITE_LINEAR + CPU readback) — **HW blocked by `fw-sdma` panic**
 
 ## Todo
 
 - [x] ATOM training (`atom_replay.py` bugs fixed)
 - [x] SMC boot
+- [ ] **Fix `fw-sdma`**: SDMA-only incremental upload, `sdma_v2_4_gfx_stop`, `unhalt=False`
+- [ ] Run `sdma-probe` on HW — prove or disprove GART device DMA
 - [ ] CPU-visible VRAM path (BAR0 or MM_INDEX) **or** proven GART DMA
-- [ ] `load_ip_firmware` / firmware resident
 - [ ] Vector-add via `add.py`
 
 ---
@@ -660,6 +1113,9 @@ python3 diag_bar0.py                    # BAR0 diagnosis
 | `AMD_BOOT_ADD` | `0` | `1` = allow `--boot-stage=add` |
 | `AMD_BOOT_GART_SYSMEM` | `auto` | `1` = host PTE table (forced in `boot_minimal_for_compute`) |
 | `AMD_BOOT_KCQ_ACTIVE_TIMEOUT_S` | `5` | poll for KCQ active after MAP_QUEUES |
+| `AMD_BOOT_SDMA_PROBE` | `0` | `1` = allow `--boot-stage=sdma-probe` (device DMA; panic risk) |
+| `AMD_BOOT_SDMA_PROBE_TIMEOUT_S` | `5` | poll dst buffer after SDMA WRITE_LINEAR |
+| `AMD_BOOT_KCQ_ACTIVATE` | `0` | `1` = allow KCQ HQD activation (after sdma-probe passes) |
 | `AMD_BOOT_DOORBELL_SETTLE_MS` | `10`/`50` | sleep after wptr signal (10 when no doorbell) |
 | `AMD_BOOT_VBIOS_FILE` | — | Path to `rx570.rom` |
 | `AMD_ATOM_JUMP_BAIL` | `0` | `1` = fake-complete ATOM (obsolete now) |
