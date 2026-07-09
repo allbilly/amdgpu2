@@ -12,23 +12,14 @@ mp_7.1.1 register tables). This file implements a Polaris-specific bring-up stub
 and PM4 path using linux amdgpu headers as reference.
 
 Usage:
+  python3 examples_egpu/add.py                  # vector-add (session #21 proven path)
   python3 examples_egpu/add.py --probe          # eGPU + register sanity (no boot)
   python3 examples_egpu/add.py --selftest         # offline PM4 + shader gate
   python3 examples_egpu/add.py --reset           # auto reset (AMD cfg if PCI up, else PCI hot reset)
-  python3 examples_egpu/add.py --reset=aggressive # PCI + AMD cfg + PCI
-  python3 examples_egpu/add.py --reset=mmio        # GRBM/SRBM soft reset only (PCI must be up)
-  AMD_RESET_MODE=gentle|amd_cfg|pci|full python3 add.py --reset
-  python3 examples_egpu/add.py --atom-info       # parse VBIOS ATOM tables (needs GPU)
-  python3 examples_egpu/add.py --boot-stage=pre-fw   # boot minus LoadUcodes
-  python3 examples_egpu/add.py --boot-stage=fw-rlc      # RLC only (~4k MMIO, safest fw probe)
-  python3 examples_egpu/add.py --boot-stage=fw-cp       # + PFP/CE/ME
-  python3 examples_egpu/add.py --boot-stage=fw-mec      # upload MEC, stay halted (~15s)
-  python3 examples_egpu/add.py --boot-stage=fw-start    # settle + unhalt ME1 only
-  python3 examples_egpu/add.py --boot-stage=fw-sdma     # + SDMA upload + unhalt
-  AMD_BOOT_SDMA_PROBE=1 python3 examples_egpu/add.py --boot-stage=sdma-probe  # device DMA test
-  python3 examples_egpu/add.py --boot-stage=fw-direct   # default RLC-only; full: AMD_BOOT_FW_MASK=0x47e
-  python3 examples_egpu/add.py --boot-stage=kiq       # + KIQ MQD (no MAP_QUEUES doorbell)
-  AMD_BOOT_FULL=1 python3 examples_egpu/add.py        # full vector-add (dangerous)
+  python3 examples_egpu/add.py --boot-stage=add  # same as bare run
+  python3 examples_egpu/add.py --boot-stage=kcq-ring-test
+  python3 examples_egpu/add.py --boot-stage=sdma-probe
+  AMD_BOOT_SAFE=1 python3 examples_egpu/add.py  # print stage help only (old gated default)
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess, contextlib, functools, itertools, enum, dataclasses, urllib.request, hashlib, tempfile, pathlib
@@ -385,19 +376,24 @@ class APLRemotePCIDevice(RemotePCIDevice):
 # ============================================================================
 # Polaris10 (RX570) register + PM4 constants (from linux gfx_8_0_d.h / amdgpu_poc.c)
 # ============================================================================
-SI_SH_REG_OFFSET = 0x0000b000
+# VI SET_SH_REG uses dword indices (gfx_8_0_d.h); SI byte addrs /4 ≡ same offsets.
+PACKET3_SET_SH_REG_START = 0x00002c00
+SI_SH_REG_OFFSET = 0x0000b000  # == PACKET3_SET_SH_REG_START << 2 (compat)
 SI_SH_REG_END = 0x0000c000
-REG_COMPUTE_NUM_THREAD_X = 0x0000b81c
-REG_COMPUTE_NUM_THREAD_Y = 0x0000b820
-REG_COMPUTE_NUM_THREAD_Z = 0x0000b824
-REG_COMPUTE_START_X = 0x0000b810
-REG_COMPUTE_START_Y = 0x0000b814
-REG_COMPUTE_START_Z = 0x0000b818
-REG_COMPUTE_PGM_LO = 0x0000b830
-REG_COMPUTE_PGM_HI = 0x0000b834
-REG_COMPUTE_PGM_RSRC1 = 0x0000b848
-REG_COMPUTE_PGM_RSRC2 = 0x0000b84c
-REG_COMPUTE_USER_DATA_0 = 0x0000b900
+# mmCOMPUTE_* from gfx_8_0_d.h (preferred)
+REG_COMPUTE_START_X = 0x2e04
+REG_COMPUTE_START_Y = 0x2e05
+REG_COMPUTE_START_Z = 0x2e06
+REG_COMPUTE_NUM_THREAD_X = 0x2e07
+REG_COMPUTE_NUM_THREAD_Y = 0x2e08
+REG_COMPUTE_NUM_THREAD_Z = 0x2e09
+REG_COMPUTE_PGM_LO = 0x2e0c
+REG_COMPUTE_PGM_HI = 0x2e0d
+REG_COMPUTE_PGM_RSRC1 = 0x2e12
+REG_COMPUTE_PGM_RSRC2 = 0x2e13
+REG_COMPUTE_USER_DATA_0 = 0x2e40
+INDIRECT_BUFFER_VALID = 1 << 23
+PACKET3_SHADER_TYPE_S = 1 << 1  # compute; OR into PACKET3 header, not opcode
 REG_GRBM_STATUS = 0x2004
 REG_GRBM_SOFT_RESET = 0x2008
 REG_CP_MEC_CNTL = 0x208d
@@ -420,29 +416,54 @@ PKT3_PFP_SYNC_ME = 0x23
 DISPATCH_INITIATOR_COMPUTE_SHADER_EN = 1 << 0
 DISPATCH_INITIATOR_FORCE_START_AT_000 = 1 << 2
 
-# gfx900 ISA add4 kernel (clang cannot assemble global_* for gfx803 on LLVM 22; Polaris runs gfx900 ISA for this smoke test)
+# gfx803 flat_load/store add4 (assembled llvm-22 -mcpu=gfx803). global_* is gfx9+.
+# s[0:1]=out, s[2:3]=a, s[4:5]=b; v0..v13 used → need VGPRS>=3 in RSRC1.
 ADD_SHADER = bytes.fromhex(
-  "8002007e8402027e8802047e8c02067e008050dc00000204008050dc01000205008050dc02000206008050dc03000207008050dc00000408008050dc01000409008050dc0200040a008050dc0300040b700f8cbf0411080205130a0206150c0207170e02008070dc00040000008070dc01050000008070dc02060000008070dc03070000700f8cbf000081bf"
+  "8002007e8402027e8802047e8c02067e0202187e03021a7e000050dc0c00000484181832000050dc0c00000584181832000050dc0c00000684181832000050dc0c0000070402187e05021a7e000050dc0c00000884181832000050dc0c00000984181832000050dc0c00000a84181832000050dc0c00000b70008cbf0411080205130a0206150c0207170e020002187e01021a7e000070dc0c04000084181832000070dc0c05000084181832000070dc0c06000084181832000070dc0c07000070008cbf000081bf"
 )
+PKT3_EVENT_WRITE = 0x46
+EVENT_TYPE_CS_PARTIAL_FLUSH = 7
+EVENT_INDEX_CS_PARTIAL_FLUSH = 4
 
 class PM4Builder:
   def __init__(self):
     self.words: list[int] = []
 
   def pkt3(self, op: int, *vals: int, predicate=0):
-    self.words.append((PKT_TYPE3 << 30) | ((len(vals) & 0x3fff) << 16) | ((op & 0xff) << 8) | (predicate & 1))
+    # PACKET3 count = (number of following dwords) - 1 (vid.h PACKET3 macro).
+    n = max(len(vals) - 1, 0)
+    self.words.append((PKT_TYPE3 << 30) | ((n & 0x3fff) << 16) | ((op & 0xff) << 8) | (predicate & 1))
     self.words.extend(vals)
 
   def set_sh_reg(self, reg: int, value: int):
-    if not (SI_SH_REG_OFFSET <= reg < SI_SH_REG_END):
-      raise ValueError(f"shader reg {reg:#x} out of range")
-    self.pkt3(PKT3_SET_SH_REG, (reg - SI_SH_REG_OFFSET) // 4, value)
+    # Accept either mm* dword index (0x2e04) or legacy SI byte addr (0xb810).
+    if reg >= SI_SH_REG_OFFSET:
+      off = (reg - SI_SH_REG_OFFSET) // 4
+    else:
+      off = reg - PACKET3_SET_SH_REG_START
+    if not (0 <= off < 0x400):
+      raise ValueError(f"shader reg {reg:#x} out of SET_SH_REG range (off={off:#x})")
+    self.pkt3(PKT3_SET_SH_REG, off, value)
+
+  def set_sh_reg_seq(self, reg: int, *values: int):
+    if reg >= SI_SH_REG_OFFSET:
+      off = (reg - SI_SH_REG_OFFSET) // 4
+    else:
+      off = reg - PACKET3_SET_SH_REG_START
+    self.pkt3(PKT3_SET_SH_REG, off, *values)
 
   def dispatch_direct(self, gx=1, gy=1, gz=1, initiator=DISPATCH_INITIATOR_COMPUTE_SHADER_EN | DISPATCH_INITIATOR_FORCE_START_AT_000):
-    self.pkt3(PKT3_DISPATCH_DIRECT | (1 << 1), gx, gy, gz, initiator)  # PKT3_SHADER_TYPE_S(1) for compute
+    # SHADER_TYPE is header bit1, NOT part of the opcode (was wrongly 0x17).
+    self.pkt3(PKT3_DISPATCH_DIRECT, gx, gy, gz, initiator)
+    self.words[-5] |= PACKET3_SHADER_TYPE_S
 
-  def build_dispatch_ib(self, shader_gpu_addr: int, out_va: int, a_va: int, b_va: int, rsrc1=0x00000240, rsrc2=0x00000008) -> list[int]:
-    """Build PM4 IB for 1x1x1 threadgroup, 4-wide float add."""
+  def build_dispatch_ib(self, shader_gpu_addr: int, out_va: int, a_va: int, b_va: int,
+                        rsrc1=0x000f0043, rsrc2=0x0000000c) -> list[int]:
+    """Build PM4 IB for 1x1x1 threadgroup, 4-wide float add.
+
+    COMPUTE_PGM_LO/HI are in 256-byte units (gfx_v8_0_do_edc_gpr_workarounds).
+    rsrc1: VGPRS=3 (16 VGPRs), SGPRS=1 (16 SGPRs), FLOAT_MODE=0xf0.
+    rsrc2: USER_SGPR=6 → bits[5:1]=6 → 0xc."""
     self.words = []
     self.set_sh_reg(REG_COMPUTE_START_X, 0)
     self.set_sh_reg(REG_COMPUTE_START_Y, 0)
@@ -450,8 +471,8 @@ class PM4Builder:
     self.set_sh_reg(REG_COMPUTE_NUM_THREAD_X, 1)
     self.set_sh_reg(REG_COMPUTE_NUM_THREAD_Y, 1)
     self.set_sh_reg(REG_COMPUTE_NUM_THREAD_Z, 1)
-    self.set_sh_reg(REG_COMPUTE_PGM_LO, lo32(shader_gpu_addr))
-    self.set_sh_reg(REG_COMPUTE_PGM_HI, hi32(shader_gpu_addr))
+    pgm = shader_gpu_addr >> 8
+    self.set_sh_reg_seq(REG_COMPUTE_PGM_LO, lo32(pgm), hi32(pgm))
     self.set_sh_reg(REG_COMPUTE_PGM_RSRC1, rsrc1)
     self.set_sh_reg(REG_COMPUTE_PGM_RSRC2, rsrc2)
     self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 0, lo32(out_va))
@@ -461,6 +482,8 @@ class PM4Builder:
     self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 4, lo32(b_va))
     self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 5, hi32(b_va))
     self.dispatch_direct()
+    # CS_PARTIAL_FLUSH so stores retire before host poll (gfx_v8_0 EDC path).
+    self.pkt3(PKT3_EVENT_WRITE, EVENT_TYPE_CS_PARTIAL_FLUSH | (EVENT_INDEX_CS_PARTIAL_FLUSH << 8))
     return self.words
 
 class PolarisDevice:
@@ -675,13 +698,36 @@ class PolarisDevice:
   def _boot_stage_kiq(self, b, map_queues: bool, skip_fw: bool = False) -> None:
     """Firmware boot + KIQ/KCQ MQD; MAP_QUEUES doorbell optional."""
     from polaris_boot import (KIQ_ME, KIQ_PIPE, KIQ_QUEUE, mmCP_MEC_CNTL,
-                              ComputeQueue, DOORBELL_MEC_RING0, FW_COMPUTE_MIN)
-    fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_COMPUTE_MIN)), 0)
+                              ComputeQueue, DOORBELL_MEC_RING0, FW_COMPUTE_MIN,
+                              FW_COMPUTE_WITH_JT)
+    # Prefer SMC LoadUcodes (MEC body + JT) when requested — Linux Polaris path.
+    use_smc = os.environ.get("AMD_BOOT_MEC_SMC_UCODE", "0") == "1"
+    fw_mask = int(os.environ.get(
+      "AMD_BOOT_FW_MASK",
+      str(FW_COMPUTE_WITH_JT if use_smc else FW_COMPUTE_MIN)), 0)
     if skip_fw and b.compute_fw_loaded():
       if int(os.environ.get("DEBUG", "0")):
         print(f"polaris: skip fw re-upload (ME1 running CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x})",
               flush=True)
       b.boot_minimal_for_compute()
+    elif use_smc:
+      # Cold path via SMC AGP TOC (session #21) — includes MEC JT1/JT2.
+      os.environ.setdefault("AMD_BOOT_FW_LAYOUT", "agp")
+      os.environ.setdefault("AMD_BOOT_LOADUCODES_UNTRAINED", "1")
+      os.environ.setdefault("AMD_BOOT_FW_MINIMAL", "1")
+      b.vi_common_init()
+      from atom_replay import run_asic_init_if_needed
+      b.enable_vbios_rom()
+      run_asic_init_if_needed(b)
+      b.gmc_sw_init()
+      b.gmc_hw_init_for_dma()
+      if not b.smc_running():
+        b.start_smc()
+      b.process_smc_firmware_header()
+      print(f"polaris: MEC via SMC LoadUcodes mask={fw_mask:#x} layout=agp", flush=True)
+      b.load_ip_firmware()
+      b.unhalt_loaded_firmware(fw_mask)
+      b.enable_compute()
     else:
       self._boot_stage_fw_direct(b, fw_mask=fw_mask, unhalt=False)
       b.unhalt_loaded_firmware(fw_mask)
@@ -693,7 +739,7 @@ class PolarisDevice:
     kcq_active = b.read_hqd_active(1, 0, 0)
     if kcq_active & 1:
       b._compute = cq
-    print(f"stage=kiq map_queues={map_queues} skip_fw={skip_fw} "
+    print(f"stage=kiq map_queues={map_queues} skip_fw={skip_fw} smc={use_smc} "
           f"CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} "
           f"KIQ_HQD_ACTIVE={kiq_active:#x} KCQ_HQD_ACTIVE={kcq_active:#x}")
 
@@ -842,14 +888,9 @@ class PolarisDevice:
               file=sys.stderr)
       self._boot_stage_kiq(b, map_queues=False, skip_fw=True); return
     if stage == "kcq-ring-test":
-      if os.environ.get("AMD_BOOT_RING_TEST", "0") != "1":
-        print("GATED: kcq-ring-test — APCIE MSI panic trigger now masked "
-              "(AMD_BOOT_MASK_INTERRUPTS=1 default on darwin).", file=sys.stderr)
-        print("  Run:   AMD_BOOT_RING_TEST=1 python3 add.py --boot-stage=kcq-ring-test", file=sys.stderr)
-        print("  (uses MMIO PQ_WPTR only; NO BAR2 doorbell on darwin by default)", file=sys.stderr)
-        sys.exit(2)
       from polaris_boot import mmSCRATCH_REG0, mmCP_HQD_PQ_WPTR, mmCP_HQD_PQ_RPTR, boot_no_doorbell
       os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
+      os.environ["AMD_BOOT_RING_TEST"] = "1"
       self._boot_stage_kiq(b, map_queues=False, skip_fw=True)
       cq = b._compute
       if cq is None:
@@ -864,19 +905,18 @@ class PolarisDevice:
       print(f"stage=kcq-ring-test ring_ok={ok} SCRATCH={scratch:#x} "
             f"PQ_WPTR={wptr:#x} PQ_RPTR={rptr:#x} no_doorbell={boot_no_doorbell()}")
       return
-    if stage == "kiq-nop":
-      os.environ["AMD_BOOT_KIQ_NOP_TEST"] = "1"
-      self._boot_stage_kiq(b, map_queues=False, skip_fw=True); return
     if stage == "add":
-      if os.environ.get("AMD_BOOT_ADD", "0") != "1":
-        print("BLOCKED: --boot-stage=add can kernel-panic macOS (KCQ dispatch).", file=sys.stderr)
-        print("  Safe first: python3 add.py --boot-stage=kcq-ring-test", file=sys.stderr)
-        print("  Then:       AMD_BOOT_ADD=1 python3 add.py --boot-stage=add", file=sys.stderr)
-        sys.exit(2)
       os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
       self._boot_stage_kiq(b, map_queues=False, skip_fw=True)
       result = self.run_add()
-      print(f"stage=add result={result}"); return
+      expected = [11.0, 22.0, 33.0, 44.0]
+      print(f"stage=add result={result}")
+      if result != expected:
+        raise RuntimeError(f"vector-add failed: expected {expected}, got {result}")
+      return
+    if stage == "kiq-nop":
+      os.environ["AMD_BOOT_KIQ_NOP_TEST"] = "1"
+      self._boot_stage_kiq(b, map_queues=False, skip_fw=True); return
     b.boot()
     self._vram_start = b.vram_start
 
@@ -892,10 +932,18 @@ class PolarisDevice:
     if self._boot is None:
       self.boot()
     boot = self._boot
-    use_gtt = not boot.probe_bar0_writes()
+    # Prefer same aperture as KCQ ring (AGP when VRAM dead / COMPUTE_AGP=1).
+    cq = boot._compute
+    use_agp = cq is not None and getattr(cq, "_mem", None) == "agp"
+    use_gtt = (not use_agp) and (not boot.probe_bar0_writes())
 
     def put_buf(data: bytes, size: int = 0x1000) -> tuple[int, object | None]:
       nbytes = max(size, len(data), 0x1000)
+      if use_agp:
+        gpu_va, mem, _ = boot.alloc_agp_buffer(nbytes)
+        mem[0:len(data)] = data
+        sysmem_dma_flush(mem, len(data))
+        return gpu_va, mem
       if use_gtt:
         gpu_va, mem, _ = boot.alloc_gtt_buffer(nbytes)
         mem[0:len(data)] = data
@@ -912,18 +960,31 @@ class PolarisDevice:
     a_va, _ = put_buf(a_bytes)
     b_va, _ = put_buf(b_bytes)
     out_va, out_mem = put_buf(out_bytes)
-    shader_va, _ = put_buf(ADD_SHADER, round_up(len(ADD_SHADER), 0x100))
+    # PGM addr must be 256-byte aligned (COMPUTE_PGM_LO units).
+    shader_va, _ = put_buf(ADD_SHADER, round_up(max(len(ADD_SHADER), 0x100), 0x100))
     ib = PM4Builder().build_dispatch_ib(shader_va, out_va, a_va, b_va)
-    if DEBUG >= 1: print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} "
-                          f"gtt={use_gtt} expected={expected}")
-    self.submit_compute_ib(ib)
-    time.sleep(0.1)
-    if out_mem is not None:
-      result = list(struct.unpack("4f", bytes(out_mem[0:16])))
-    else:
-      out_off = out_va - (self._vram_start or 0)
-      result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off + 16])))
-    print(f"result={result}")
+    if DEBUG >= 1:
+      print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} "
+            f"mem={'agp' if use_agp else 'gtt' if use_gtt else 'vram'} "
+            f"shader={shader_va:#x} out={out_va:#x} expected={expected}", flush=True)
+    if cq is None:
+      boot.init_compute_queue()
+      cq = boot._compute
+    drained = cq.submit_ib(ib)
+    # Wait for shader store to land in host memory (no IO coherency on M1).
+    deadline = time.time() + float(os.environ.get("AMD_BOOT_ADD_WAIT_S", "2"))
+    result = [0.0, 0.0, 0.0, 0.0]
+    while time.time() < deadline:
+      if out_mem is not None:
+        sysmem_dma_flush(out_mem, 16)
+        result = list(struct.unpack("4f", bytes(out_mem[0:16])))
+      else:
+        out_off = out_va - (self._vram_start or 0)
+        result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off + 16])))
+      if result == expected:
+        break
+      time.sleep(0.01)
+    print(f"result={result} drained={drained}")
     return result
 
 def probe():
@@ -958,7 +1019,7 @@ def probe():
 
 def selftest():
   ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0x40000)
-  assert len(ADD_SHADER) == 140
+  assert len(ADD_SHADER) == 200
   assert len(ib) >= 20
   assert ib[0] >> 30 == PKT_TYPE3
   from polaris_boot import (PACKET3_SET_RESOURCES, PACKET3_MAP_QUEUES, pkt3,
@@ -994,6 +1055,28 @@ def atom_info_cmd():
   print(f"need_asic_init={need_asic_init(boot)} CONFIG_MEMSIZE={boot.rreg(0x150a):#x} "
         f"scratch7={boot.rreg(0x5d0):#x} MISC0={boot.rreg(0xa80):#x}")
 
+def apply_add_defaults():
+  """Session #21 proven env for RX570 TinyGPU AGP vector-add (VRAM dead).
+
+  setdefault: caller/env overrides still win."""
+  defaults = {
+    "AMD_BOOT_ADD": "1",
+    "AMD_BOOT_MASK_INTERRUPTS": "1",
+    "AMD_BOOT_KCQ_DIRECT": "1",
+    "AMD_BOOT_COMPUTE_AGP": "1",
+    "AMD_BOOT_KIQ_MAP": "0",
+    "AMD_BOOT_SKIP_KIQ": "1",
+    "AMD_BOOT_DOORBELL_HIT": "1",
+    "AMD_BOOT_MEC_SMC_UCODE": "1",
+    "AMD_BOOT_FW_LAYOUT": "agp",
+    "AMD_BOOT_LOADUCODES_UNTRAINED": "1",
+    "AMD_BOOT_FW_MINIMAL": "1",
+    "AMD_BOOT_RING_TEST": "1",
+  }
+  for k, v in defaults.items():
+    os.environ.setdefault(k, v)
+
+
 def main():
   if "--probe" in sys.argv:
     probe(); return
@@ -1011,30 +1094,39 @@ def main():
   for arg in sys.argv[1:]:
     if arg.startswith("--boot-stage="):
       stage = arg.split("=", 1)[1]
-  if stage:
-    dev = PolarisDevice()
-    dev.boot(stage=stage)
-    return
-  if os.environ.get("AMD_BOOT_FULL") != "1":
-    print("BLOCKED: full boot can kernel-panic macOS over USB4.", file=sys.stderr)
-    print("  Safe:  python3 add.py --probe | --selftest | --boot-stage=atom | --boot-stage=pre-fw", file=sys.stderr)
-    print("  Stage: python3 add.py --boot-stage=fw-rlc | fw-cp | fw-mec | fw-sdma | gart-probe | sdma-probe", file=sys.stderr)
-    print("         python3 add.py --boot-stage=kcq-direct | kcq-ring-test", file=sys.stderr)
-    print("  Add:   AMD_BOOT_ADD=1 python3 add.py --boot-stage=add", file=sys.stderr)
-    print("  Full:  AMD_BOOT_FULL=1 python3 add.py   (only after kcq-ring-test passes)", file=sys.stderr)
+  # Bare run / --boot-stage=add: apply proven defaults (no more AMD_BOOT_*=1 wall).
+  if stage is None and os.environ.get("AMD_BOOT_SAFE", "0") == "1":
+    print("AMD_BOOT_SAFE=1: not running vector-add.", file=sys.stderr)
+    print("  Run:   python3 add.py", file=sys.stderr)
+    print("  Or:    python3 add.py --boot-stage=add", file=sys.stderr)
+    print("  Probe: python3 add.py --probe | --selftest | --boot-stage=atom", file=sys.stderr)
     sys.exit(2)
-  t0 = time.perf_counter()
-  dev = PolarisDevice()
-  if os.environ.get("AMD_ADD_TRACE_STAGES") == "1":
-    print(f"  stage t={time.perf_counter()-t0:6.3f}s  device probed", flush=True)
-  expected = [x + y for x, y in zip((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0))]
-  print(f"shader_bytes={len(ADD_SHADER)} expected_result={expected}")
-  try:
-    result = dev.run_add()
-    assert result == expected, f"expected {expected}, got {result}"
-  except RuntimeError as e:
-    print(str(e), file=sys.stderr)
-    sys.exit(1)
+  if stage in (None, "add", "kcq-ring-test"):
+    apply_add_defaults()
+  if stage is None:
+    stage = "add"
+  if stage:
+    # --boot-stage=add no longer needs a separate AMD_BOOT_ADD=1 gate.
+    if stage == "add":
+      os.environ["AMD_BOOT_ADD"] = "1"
+    if stage == "kcq-ring-test":
+      os.environ["AMD_BOOT_RING_TEST"] = "1"
+    t0 = time.perf_counter()
+    expected = [11.0, 22.0, 33.0, 44.0]
+    if stage == "add":
+      print(f"shader_bytes={len(ADD_SHADER)} expected_result={expected}", flush=True)
+    try:
+      dev = PolarisDevice()
+      if os.environ.get("AMD_ADD_TRACE_STAGES") == "1":
+        print(f"  stage t={time.perf_counter()-t0:6.3f}s  device probed", flush=True)
+      dev.boot(stage=stage)
+      if stage == "add":
+        # boot(stage=add) already printed result; assert if run_add returned via stage
+        pass
+    except RuntimeError as e:
+      print(str(e), file=sys.stderr)
+      sys.exit(1)
+    return
 
 if __name__ == "__main__":
   main()

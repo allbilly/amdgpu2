@@ -2,37 +2,48 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-10 ~01:25 — **session #19: `write_ok=True` / `srbm_ok=True`**
+**Last updated:** 2026-07-10 ~02:10 — **session #21: `add.py` vector-add PASS**
 
-## Current status (read this first)
+## Current status
 
-**SDMA Level B PASS:** F32 **executes and retires**.
-- `AMD_BOOT_SDMA_PKT=srbm` → `DUMMY_REG=0xa5a5a5a5`, `ring_drained=True`
-- `AMD_BOOT_SDMA_PKT=write` → host AGP dst `0xDEADBEEF`, `write_ok=True`
-
-**Still blocked for full `add.py`:** vector-add needs **MEC/KCQ** (SDMA cannot ALU).
-Next: `kcq-ring-test` now that device↔host DMA is proven.
-
-### Session #19 — F32 execute unblocked (DeepWiki + HW)
-
-Fix combo that finally retired packets (after reset; clear FREEZE between probes):
-
-| Knob | Value | Role |
-|------|-------|------|
-| `MEM_POWER_OVERRIDE` | `POWER=0x100` sticks | SDMA mem powered (full golden `0x3c800` still ignored) |
-| `RPTR_WB` | Linux-style AGP page + bit12 | RPTR publish / retire path |
-| `DOORBELL` | OFFSET=`0x1e0`, ENABLE=0 | TrustOS “Linux doorbell values” without waiting for ring |
-| `PHASE` | `0xff0f` (now default) | clears `CTX_STATUS.EXPIRED` |
-| Clear `FREEZE` | before ring setup | else next probe `FETCH=0` |
+**PASS:** KCQ `ring_ok=True` (`SCRATCH=0xDEADBEEF`) + **vector-add**
+`result=[11.0, 22.0, 33.0, 44.0]` on AGP host buffers (VRAM still dead).
 
 ```bash
-AMD_BOOT_SDMA_PROBE=1 AMD_BOOT_SDMA_AGP=1 \
-  python3 add.py --boot-stage=sdma-probe          # WRITE_LINEAR → write_ok
-AMD_BOOT_SDMA_PROBE=1 AMD_BOOT_SDMA_AGP=1 \
-  AMD_BOOT_SDMA_PKT=srbm python3 add.py --boot-stage=sdma-probe
+# Full success path:
+AMD_BOOT_ADD=1 AMD_BOOT_MASK_INTERRUPTS=1 AMD_BOOT_KCQ_DIRECT=1 \
+  AMD_BOOT_COMPUTE_AGP=1 AMD_BOOT_KIQ_MAP=0 AMD_BOOT_SKIP_KIQ=1 \
+  AMD_BOOT_DOORBELL_HIT=1 AMD_BOOT_MEC_SMC_UCODE=1 \
+  AMD_BOOT_FW_LAYOUT=agp AMD_BOOT_LOADUCODES_UNTRAINED=1 AMD_BOOT_FW_MINIMAL=1 \
+  python3 add.py --boot-stage=add
 ```
 
-### Session #18 — DeepWiki + Linux SMC LoadUcodes path
+### Session #21 — KCQ execute + vector-add
+
+DeepWiki rerank (AGENTS.md, helpfulness for this bring-up):
+
+| Rank | Repo | Score | Why |
+|------|------|------:|-----|
+| 1 | torvalds/linux / ROCm/amdgpu | 10 | gfx_v8 MQD/PRELOAD, SET_UCONFIG offset, SH_MEM VMID0, IB emit |
+| 2 | allbilly/amdgpu | 10 | this tree |
+| 3 | nathan237/TrustOS | 9 | AGP DMA / Polaris bare-metal journal |
+| 4 | tinygrad/tinygrad (+7900xtx) | 6–7 | PM4/IB patterns; not gfx803 boot |
+| 5+ | passthrough / Hackintosh / sims / ZLUDA / … | 0–3 | N/A for MEC KCQ |
+
+| Fix | Result |
+|-----|--------|
+| **SET_UCONFIG offset: drop `>>2`** | Was `0x10` not `0x40` → ring drained, SCRATCH untouched. Now `ring_ok=True` |
+| **`submit_ib`: real `INDIRECT_BUFFER` (0x3F)** | Was NOP `0x10` + inline words → RPTR stuck |
+| **AGP buffers for shader/a/b/out** | Match KCQ aperture (VRAM dead) |
+| **`COMPUTE_PGM_LO/HI >>= 8`** | Linux 256-byte units |
+| **gfx803 `flat_*` shader** (not gfx900 `global_*`) | Assembled llvm `-mcpu=gfx803` |
+| **RSRC1 VGPRS=3 / USER_SGPR=6** | Flat shader needs v0–v13 |
+| **`init_sh_mem_vmid0` (UC + BASES=0)** | **Unblocked flat stores** → add PASS |
+| PACKET3 count = `len(vals)-1` | Header encoding |
+
+Still true: VRAM BAR0/MM writes fail after HDP; use AGP for rings/data.
+
+### Session #19 — F32 execute unblocked (`write_ok=True`)
 
 DeepWiki: almost all AGENTS.md repos **N/A** for Polaris F32 execute; only
 TrustOS / linux / this tree / tinygrad remain useful.
@@ -148,21 +159,21 @@ Success: `write_ok=True dst=0xdeadbeef` (not just `fetch_ok` / `EXP=False`).
 4. Only then vector-add (`AMD_BOOT_ADD=1`)
 
 
-## Reference repos — helpfulness (reranked, session #19)
+## Reference repos — helpfulness (reranked, session #20)
 
-Blocker was **F32 execute after fetch**; now **PASS**. Remaining: MEC/KCQ for vector-add.
+Blocker now: **MEC/KCQ ring fetch** (`ACTIVE=1`, `RPTR=0`). SDMA execute is PASS.
 
-| Rank | Repo | Score | Why for *this* bring-up |
-|------|------|-------|------------------------|
-| **1** | `nathan237/TrustOS` | **10/10** | Doorbell OFFSET `0x1e0`, PHASE/EXPIRED, RPTR_WB, MEM_POWER — exact knobs that unlocked execute |
-| **2** | `torvalds/linux` / `ROCm/amdgpu` | **10/10** | gfx_resume RPTR_WB + golden; MEM_POWER_OVERRIDE; SMC LoadUcodes |
-| **3** | `allbilly/amdgpu` | **10/10** | This tree — AGP probe + session #19 fix |
-| **4** | `tinygrad/tinygrad` | **5/10** | DMA model; SDMA≠ALU (vector-add still needs CP) |
-| **5** | `TheTom/pascal-egpu` | **3/10** | Analogous eGPU power-gate class; not Polaris-specific |
-| **6** | `komen205/polaris30-smu-bist` / NootedRed / rpi-pcie / tenstorrent | **2–3/10** | Weak |
-| **7** | Passthrough / Hackintosh / sims / ZLUDA / … | **0/10** | DeepWiki: N/A |
+| Rank | Repo | Score | Why |
+|------|------|-------|-----|
+| **1** | `torvalds/linux` / `ROCm/amdgpu` | **10/10** | `PRELOAD_SIZE` mask; `mqd_commit` poll; KFD `DOORBELL_EN`; gfx_v7 MEC load |
+| **2** | `allbilly/amdgpu` | **10/10** | This tree — AGP SDMA proof + PRELOAD bugfix |
+| **3** | `nathan237/TrustOS` | **8/10** | Same class of fetch-OK/retire issues; no recorded SCRATCH=DEADBEEF |
+| **4** | `tinygrad/tinygrad` | **5/10** | MEC setup_ring / doorbell_en patterns |
+| **5** | pascal-egpu / SMU-BIST / NootedRed / rpi / tenstorrent | **2–3/10** | Weak analogy |
+| **6** | Passthrough / Hackintosh / sims / ZLUDA / … | **0/10** | DeepWiki N/A |
 
-**Next:** KCQ ring-test (`SCRATCH=0xDEADBEEF`) now that host DMA works; then `AMD_BOOT_ADD=1`.
+**Next:** why MEC stays busy without advancing RPTR after correct `PS=0x5300` —
+SMC LoadUcodes for MEC+JT (vs direct MMIO), RLC CP jump table, or real doorbell.
 
 **Linux init order (confirmed from `gmc_v8_0_hw_init` + `sdma_v3_0_gfx_resume`):**
 ```
