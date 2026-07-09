@@ -17,10 +17,9 @@ Usage:
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess
-import contextlib, functools, itertools, enum, dataclasses, urllib.request, hashlib
+import contextlib, functools, enum, urllib.request, hashlib
 import tempfile, pathlib, math, json
 from dataclasses import dataclass, field
-from typing import Callable
 
 # =============================================================================
 # TinyGPU transport + PM4 helpers (from examples_egpu/add.py)

@@ -2,25 +2,19 @@
 """Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-mul over TinyGPU.app on macOS.
 
 Vendored single-file (nvgpu examples/add.py style): TinyGPU transport + ATOM BIOS
-interpreter + Polaris boot/ComputeQueue + PM4 vector-mul. No runtime import of
-polaris_boot / atom_replay.
+interpreter + Polaris boot/ComputeQueue + PM4 vector-mul.
 
 Usage:
-  python3 examples_egpu/add.py                  # vector-add (session #21 proven path)
-  python3 examples_egpu/add.py --probe          # eGPU + register sanity (no boot)
-  python3 examples_egpu/add.py --selftest         # offline PM4 + shader gate
-  python3 examples_egpu/add.py --reset           # auto reset (AMD cfg if PCI up, else PCI hot reset)
-  python3 examples_egpu/add.py --boot-stage=add  # same as bare run
-  python3 examples_egpu/add.py --boot-stage=kcq-ring-test
-  python3 examples_egpu/add.py --boot-stage=sdma-probe
-  AMD_BOOT_SAFE=1 python3 examples_egpu/add.py  # print stage help only (old gated default)
+  python3 examples_egpu/mul.py
+  python3 examples_egpu/mul.py --test
+  python3 examples_egpu/mul.py --selftest
+  python3 examples_egpu/mul.py --boot-stage=add
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess
-import contextlib, functools, itertools, enum, dataclasses, urllib.request, hashlib
+import contextlib, functools, enum, urllib.request, hashlib
 import tempfile, pathlib, math, json
 from dataclasses import dataclass, field
-from typing import Callable
 
 # =============================================================================
 # TinyGPU transport + PM4 helpers (from examples_egpu/add.py)

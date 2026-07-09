@@ -2,16 +2,29 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-10 ~02:15 — **session #22: standalone `add.py` + hot-MEC fix**
+**Last updated:** 2026-07-10 — deadcode cleanup: keep `add.py` / `mul.py` / `trig.py` + `progress.md` only
+(vendored standalone; removed one-shot `trace_*` / `test_*` / duplicate `polaris_boot.py`+`atom_replay.py`).
 
 ## Current status
 
-**PASS:** `python examples_egpu/add.py` (no env vars) → `[11.0, 22.0, 33.0, 44.0]`
-first try even when GPU left hot from a previous run.
+**PASS:** `python examples_egpu/add.py` → `[11.0, 22.0, 33.0, 44.0]` (~1s cold boot)
+**PASS:** `python examples_egpu/mul.py --test`
+**PASS:** `python examples_egpu/trig.py` → `triangle.ppm` (18625 red pixels)
 
 ```bash
 python examples_egpu/add.py
+python examples_egpu/mul.py
+python examples_egpu/trig.py
 ```
+
+### Live files
+
+| File | Role |
+|------|------|
+| `add.py` | Standalone vector-add (vendors ATOM + Polaris boot) |
+| `mul.py` | Same stack, `v_mul_f32` |
+| `trig.py` | Compute raster of `examples/radv_triangle.c` verts → PPM |
+| `progress.md` | Bring-up log (historical) |
 
 ### Session #22 — first-boot fail + single-file
 
@@ -1089,10 +1102,9 @@ vi_common_init → enable_vbios_rom → ATOM asic_init
 | File | Role |
 |------|------|
 | `add.py` | Transport, `PolarisDevice`, CLI, PM4 |
-| `polaris_boot.py` | VI boot: SMC, MC, GART, LoadUcodes gates |
-| `atom_replay.py` | ATOM `asic_init` interpreter |
-| `diag_bar0.py` | BAR0 aperture diagnosis |
-| `test_gtt_load.py` | **Unsafe** — GTT LoadUcodes experiment |
+| `add.py` / `mul.py` / `trig.py` | Standalone (vendored ATOM + Polaris boot) — live entry points |
+| ~~`polaris_boot.py` / `atom_replay.py`~~ | Removed — duplicated inside the standalone scripts |
+| ~~`diag_bar0.py` / `test_*` / `trace_*`~~ | Removed — one-shot bring-up probes |
 | `shaders/egpu-add4.s` | gfx803 add kernel |
 
 ---
