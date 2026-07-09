@@ -2,21 +2,24 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-10 ~02:10 — **session #21: `add.py` vector-add PASS**
+**Last updated:** 2026-07-10 ~02:15 — **session #22: standalone `add.py` + hot-MEC fix**
 
 ## Current status
 
-**PASS:** KCQ `ring_ok=True` (`SCRATCH=0xDEADBEEF`) + **vector-add**
-`result=[11.0, 22.0, 33.0, 44.0]` on AGP host buffers (VRAM still dead).
+**PASS:** `python examples_egpu/add.py` (no env vars) → `[11.0, 22.0, 33.0, 44.0]`
+first try even when GPU left hot from a previous run.
 
 ```bash
-# Full success path:
-AMD_BOOT_ADD=1 AMD_BOOT_MASK_INTERRUPTS=1 AMD_BOOT_KCQ_DIRECT=1 \
-  AMD_BOOT_COMPUTE_AGP=1 AMD_BOOT_KIQ_MAP=0 AMD_BOOT_SKIP_KIQ=1 \
-  AMD_BOOT_DOORBELL_HIT=1 AMD_BOOT_MEC_SMC_UCODE=1 \
-  AMD_BOOT_FW_LAYOUT=agp AMD_BOOT_LOADUCODES_UNTRAINED=1 AMD_BOOT_FW_MINIMAL=1 \
-  python3 add.py --boot-stage=add
+python examples_egpu/add.py
 ```
+
+### Session #22 — first-boot fail + single-file
+
+| Issue | Fix |
+|-------|-----|
+| Hot MEC + `skip_fw=True` | Stale KCQ → `drained=False` / zeros; retry soft-reset then PASS |
+| Fix | Detect `compute_fw_loaded()` → soft-reset → **cold** SMC LoadUcodes (`skip_fw=False`) |
+| Standalone | `add.py` vendors `atom_replay` + `polaris_boot` (~5635 lines), like nvgpu `examples/add.py` |
 
 ### Session #21 — KCQ execute + vector-add
 
