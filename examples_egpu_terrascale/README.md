@@ -17,7 +17,8 @@ User-space compute reference: Mesa **r600g** `evergreen_compute.c`
 
 ## Status
 
-**Hardware not attached yet.** `add.py` is offline-first:
+`add.py` is offline-first, and the HD 4850 CP smoke path has been exercised
+with AGP-mapped host sysmem while local VRAM remains unusable:
 
 ```bash
 python3 examples_egpu_terrascale/add.py --selftest --chip=hd5570
@@ -38,6 +39,13 @@ python3 examples_egpu_terrascale/add.py --probe --chip=hd5570
 | ATOM / MC / CP boot on TinyGPU | **TODO** | **TODO** |
 | RAT / global buffer bindings | **TODO** | n/a |
 
+For RV770, `--cp-mem-write-test` does not use local VRAM: it places the CP ring,
+writeback page, and `MEM_WRITE` result buffer in contiguous host sysmem behind
+the AGP aperture. BAR0 is deliberately lazy and only mapped for `--vram-probe`
+or an explicitly requested BAR0 probe. It is strictly a CP payload-write test,
+not GPU arithmetic; the default command refuses to CPU-offload an add. This is
+the supported diagnostic path while GDDR3 writes return a floating-bus value.
+
 ## Evergreen compute path (HD 5570)
 
 Mirrors Mesa `evergreen_emit_cs_shader` + `evergreen_emit_dispatch`:
@@ -55,9 +63,23 @@ shaders. Next step: assemble with `llvm-mc`/`llc` `-march=r600 -mcpu=redwood`.
 
 ## RV770 path (HD 4850)
 
-Shares R600 CP (`r600_cp_resume`) but **no Evergreen LS compute**. This tree only
-dumps ME_INITIALIZE + CP RB programming for now; a GFX/ALU or blit-based smoke
-comes after HW.
+Shares R600 CP (`r600_cp_resume`) but **no Evergreen LS compute**. A genuine
+RV770 pixel shader source now lives in `rv770_add.ll`; it compiles to four R600
+hardware `ADD` ALU instructions plus a color export. Its matching vertex shader
+is `rv770_vs.ll`, which exports clip position and the two vec4 operands to the
+pixel stage:
+
+```bash
+python3 examples_egpu_terrascale/add.py --compile-rv770-add
+AMD_BOOT_ATOM=0 python3 examples_egpu_terrascale/add.py --gpu-add-preflight
+```
+
+The compiler inspection does not touch hardware. The preflight allocates the
+48-byte VS, 64-byte PS, three-vertex input buffer, and FP32 output target in
+contiguous AGP sysmem, but deliberately issues no graphics packets. The
+remaining work is to bind that state through the RV770 graphics draw pipeline
+and read the GPU-produced result. Until that exists, default `add.py` refuses
+to replace GPU arithmetic with a CPU calculation.
 
 ## vs Polaris (`examples_egpu`)
 

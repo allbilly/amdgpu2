@@ -1,6 +1,7 @@
-linux code at ref/linux
+linux code at ref/linux or deepwiki at torvalds/linux
 
 ask deepwiki on github repo
+- torvalds/linux
 - TheTom/pascal-egpu
 - kc9zda/atombios-inspect
 - Zile995/PinnacleRidge-Polaris-GPU-Passthrough

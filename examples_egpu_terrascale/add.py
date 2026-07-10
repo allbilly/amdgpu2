@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
+# NO CPU OFFLOAD: never label a CPU-calculated payload as a GPU add.  The
+# --cp-mem-write-test diagnostic only proves CP DMA; true GPU add must execute
+# an RV770 graphics/ALU shader and fails loudly until that path exists.
 """Standalone Terascale eGPU vector-add scaffold (HD 5570 / HD 4850) over TinyGPU.
 
-Hardware not required yet — `--selftest` / `--dry-run` work offline. When the
+Hardware not required yet - `--selftest` / `--dry-run` work offline. When the
 card is attached via TinyGPU, `--probe` enumerates PCI and MMIO.
 
 Targets (linux `drivers/gpu/drm/radeon`):
-  HD 5570 — Redwood / Evergreen (TeraScale 2), PCI 1002:68D9 (also 68D8/68DA…)
-  HD 4850 — RV770 / R700     (TeraScale 1), PCI 1002:9442
+  HD 5570 - Redwood / Evergreen (TeraScale 2), PCI 1002:68D9 (also 68D8/68DA...)
+  HD 4850 - RV770 / R700     (TeraScale 1), PCI 1002:9442
 
 Evergreen has a real compute path (Mesa `evergreen_compute.c` / r600g OpenCL):
   SQ_PGM_START_LS + SPI_COMPUTE_NUM_THREAD_* + PKT3_DISPATCH_DIRECT (compute bit).
@@ -20,11 +23,20 @@ Usage:
   python3 examples_egpu_terrascale/add.py --chip=hd5570 --dry-run
   python3 examples_egpu_terrascale/add.py --probe          # needs TinyGPU + card
   python3 examples_egpu_terrascale/add.py --dump-rom       # dump onboard VBIOS
-  python3 examples_egpu_terrascale/add.py --atom           # ATOM asic_init only
-  python3 examples_egpu_terrascale/add.py --ring-test      # CP bring-up
+  python3 examples_egpu_terrascale/add.py --clock-probe    # SPLL_CHG / MPLL CLKF
+  python3 examples_egpu_terrascale/add.py --atom           # ATOM asic_init (needs real SPLL_CHG)
+  python3 examples_egpu_terrascale/add.py --cp-mem-write-test
+                                                        # CP/AGP payload-write diagnostic, not add
+  python3 examples_egpu_terrascale/add.py --gpu-add-preflight
+                                                        # allocates real VS/PS/input/target, no draw
+  python3 examples_egpu_terrascale/add.py                  # true GPU add; fails until RV770 ALU path lands
+
+HD 4850: AGP-first (MEMSIZE=stub, FB@0xE0..., BIF off). Cold CHG -> --atom for MPLL;
+warm re-runs work with AMD_BOOT_ATOM=0. Default add never maps or accesses BAR0/VRAM.
+Never AMD_ATOM_SYNTH_SPLL_CHG / BIF+BAR0 poke.
 """
 from __future__ import annotations
-import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess
+import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess, shutil
 import contextlib, functools, enum, urllib.request, hashlib
 import tempfile, pathlib, math, json
 from dataclasses import dataclass, field
@@ -106,7 +118,7 @@ class MMIOInterface:
 def sysmem_dma_flush(mem, size: int):
   """Flush CPU writes so eGPU DMA sees host memory (ARM lacks IO coherency).
 
-  See geerlingguy/raspberry-pi-pcie-devices#756 — Pi5/M1 need explicit sync for
+  See geerlingguy/raspberry-pi-pcie-devices#756 - Pi5/M1 need explicit sync for
   GPU DMA to see CPU-written sysmem (yanghaku pgprot_dmacoherent TTM patch).
   """
   if os.environ.get("AMD_BOOT_SYSMEM_FLUSH", "1") == "0":
@@ -251,12 +263,12 @@ class RemotePCIDevice:
         seen += 1
         cap_id = self.read_config(cap, 1) & 0xff
         nxt = self.read_config(cap + 1, 1) & 0xfc
-        if cap_id == 0x05:  # MSI capability — clear MSI Enable (bit 0 of Message Control)
+        if cap_id == 0x05:  # MSI capability - clear MSI Enable (bit 0 of Message Control)
           mc = self.read_config(cap + 2, 2)
           if mc & 0x1:
             self.write_config(cap + 2, 2, mc & ~0x1)
           cleared.append(f"msi@{cap:#x}")
-        elif cap_id == 0x11:  # MSI-X — clear MSI-X Enable (bit 15), set Function Mask (bit 14)
+        elif cap_id == 0x11:  # MSI-X - clear MSI-X Enable (bit 15), set Function Mask (bit 14)
           mc = self.read_config(cap + 2, 2)
           self.write_config(cap + 2, 2, (mc & ~(1 << 15)) | (1 << 14))
           cleared.append(f"msix@{cap:#x}")
@@ -384,8 +396,8 @@ class APLRemotePCIDevice(RemotePCIDevice):
 # =============================================================================
 # Chip table (PCI IDs from pci-ids / linux-hardware; family from radeon_family.h)
 # =============================================================================
-CHIP_RV770 = "rv770"       # radeon_family.h CHIP_RV770 — HD 4850
-CHIP_REDWOOD = "redwood"   # radeon_family.h CHIP_REDWOOD — HD 5570
+CHIP_RV770 = "rv770"       # radeon_family.h CHIP_RV770 - HD 4850
+CHIP_REDWOOD = "redwood"   # radeon_family.h CHIP_REDWOOD - HD 5570
 
 @dataclass(frozen=True)
 class ChipInfo:
@@ -405,7 +417,7 @@ CHIPS: dict[str, ChipInfo] = {
     terrascale=2,
     has_ls_compute=True,
     llvm_mcpu="redwood",
-    note="Evergreen Redwood PRO/LE — Mesa r600g OpenCL / evergreen_compute.c",
+    note="Evergreen Redwood PRO/LE - Mesa r600g OpenCL / evergreen_compute.c",
   ),
   "hd4850": ChipInfo(
     name="Radeon HD 4850",
@@ -414,7 +426,7 @@ CHIPS: dict[str, ChipInfo] = {
     terrascale=1,
     has_ls_compute=False,
     llvm_mcpu="rv770",
-    note="R700 RV770 — GFX CP only here; no Evergreen LS compute",
+    note="R700 RV770 - GFX CP only here; no Evergreen LS compute",
   ),
 }
 
@@ -431,12 +443,12 @@ def resolve_chip(argv: list[str] | None = None) -> ChipInfo:
   return CHIPS[key]
 
 # =============================================================================
-# Registers / PM4 — ref/linux radeon evergreend.h + r600d.h
+# Registers / PM4 - ref/linux radeon evergreend.h + r600d.h
 # =============================================================================
 # Byte MMIO offsets (WREG32 style). SET_CONFIG/CONTEXT use these as absolute
 # byte addresses; packet offset = (addr - START) >> 2.
 
-# r600d.h / evergreend.h — CP ring (r600_cp_resume)
+# r600d.h / evergreend.h - CP ring (r600_cp_resume)
 REG_CP_RB_BASE = 0xC100
 REG_CP_RB_CNTL = 0xC104
 REG_CP_RB_RPTR_WR = 0xC108
@@ -456,14 +468,14 @@ REG_GRBM_SOFT_RESET = 0x8020     # r600d.h GRBM_SOFT_RESET
 REG_GRBM_STATUS = 0x8010
 SOFT_RESET_CP = 1 << 0
 
-# evergreend.h — VGT compute (config space)
+# evergreend.h - VGT compute (config space)
 REG_VGT_NUM_INDICES = 0x8970
 REG_VGT_COMPUTE_START_X = 0x899C
 REG_VGT_COMPUTE_START_Y = 0x89A0
 REG_VGT_COMPUTE_START_Z = 0x89A4
 REG_VGT_COMPUTE_THREAD_GROUP_SIZE = 0x89AC
 
-# evergreend.h — context regs (SET_CONTEXT_REG)
+# evergreend.h - context regs (SET_CONTEXT_REG)
 REG_SPI_COMPUTE_NUM_THREAD_X = 0x286EC
 REG_SPI_COMPUTE_NUM_THREAD_Y = 0x286F0
 REG_SPI_COMPUTE_NUM_THREAD_Z = 0x286F4
@@ -475,11 +487,14 @@ REG_SQ_LDS_ALLOC = 0x288E8
 # Packet3 (evergreend.h)
 PKT_TYPE3 = 3
 PKT3_NOP = 0x10
+PKT3_CONTEXT_CONTROL = 0x28
+PKT3_DRAW_INDEX_AUTO = 0x2D
 PKT3_DISPATCH_DIRECT = 0x15
 PKT3_INDIRECT_BUFFER = 0x32
 PKT3_EVENT_WRITE = 0x46
 PKT3_SET_CONFIG_REG = 0x68
 PKT3_SET_CONTEXT_REG = 0x69
+PKT3_SET_RESOURCE = 0x6D
 PKT3_ME_INITIALIZE = 0x44
 PACKET3_SET_CONFIG_REG_START = 0x00008000
 PACKET3_SET_CONTEXT_REG_START = 0x00028000
@@ -492,7 +507,7 @@ RB_RPTR_WR_ENA = 1 << 31
 RB_NO_UPDATE = 1 << 27
 
 def packet3(op: int, n: int, compute: bool = False) -> int:
-  """PACKET3(op, n) — evergreend.h; optional compute bit (Mesa PKT3C)."""
+  """PACKET3(op, n) - evergreend.h; optional compute bit (Mesa PKT3C)."""
   hdr = (PKT_TYPE3 << 30) | ((n & 0x3FFF) << 16) | ((op & 0xFF) << 8)
   if compute:
     hdr |= PACKET3_COMPUTE_MODE
@@ -507,8 +522,32 @@ def S_0288D4_DX10_CLAMP(x: int) -> int:
 def S_0288D4_STACK_SIZE(x: int) -> int:
   return (x & 0xFF) << 8
 
+# RV770 graphics registers / encodings, copied from Mesa r600d.h.  Values are
+# byte MMIO addresses; PM4 converts them to packet-relative dword offsets.
+REG_VGT_PRIMITIVE_TYPE = 0x8958
+REG_CB_COLOR0_BASE, REG_CB_COLOR0_SIZE = 0x28040, 0x28060
+REG_CB_COLOR0_VIEW, REG_CB_COLOR0_INFO, REG_CB_COLOR0_MASK = 0x28080, 0x280A0, 0x28100
+REG_CB_TARGET_MASK, REG_CB_SHADER_MASK = 0x28238, 0x2823C
+REG_SQ_PGM_START_PS, REG_SQ_PGM_RESOURCES_PS, REG_SQ_PGM_EXPORTS_PS = 0x28840, 0x28850, 0x28854
+REG_SQ_PGM_START_VS, REG_SQ_PGM_RESOURCES_VS, REG_SQ_PGM_START_FS = 0x28858, 0x28868, 0x28894
+REG_SPI_VS_OUT_ID_0, REG_SPI_VS_OUT_CONFIG = 0x28614, 0x286C4
+REG_SPI_PS_INPUT_CNTL_0, REG_SPI_PS_IN_CONTROL_0, REG_SPI_PS_IN_CONTROL_1 = 0x28644, 0x286CC, 0x286D0
+REG_PA_CL_VTE_CNTL = 0x28818
+REG_PA_SC_WINDOW_SCISSOR_TL, REG_PA_SC_WINDOW_SCISSOR_BR = 0x28204, 0x28208
+REG_PA_SC_GENERIC_SCISSOR_TL, REG_PA_SC_GENERIC_SCISSOR_BR = 0x28240, 0x28244
+REG_PA_SC_VPORT_SCISSOR_0_TL, REG_PA_SC_VPORT_SCISSOR_0_BR = 0x28250, 0x28254
+REG_PA_CL_VPORT_XSCALE_0 = 0x2843C
+REG_PA_SU_SC_MODE_CNTL, REG_PA_SC_MODE_CNTL = 0x28814, 0x28A4C
+REG_PA_SU_VTX_CNTL, REG_CB_COLOR_CONTROL = 0x28C08, 0x28808
+REG_CB_BLEND0_CONTROL, REG_CB_BLEND_CONTROL = 0x28780, 0x28804
+
+RV770_FETCH_RESOURCE_VS = 160
+RV770_VTX_FORMAT_32_32_32_32_FLOAT = 0x23
+RV770_COLOR_32_32_32_32_FLOAT = 0x23
+RV770_DI_PT_TRILIST, RV770_DI_SRC_SEL_AUTO_INDEX = 4, 2
+
 # =============================================================================
-# Placeholder CF/ALU binary (Evergreen LS) — replaced when HW + llvm-mc land
+# Placeholder CF/ALU binary (Evergreen LS) - replaced when HW + llvm-mc land
 # =============================================================================
 # Real Evergreen compute shaders are CF + ALU clause binaries (r600 ISA), not
 # GCN VOP2. Until we assemble with llvm -march=r600 -mcpu=redwood, ship a
@@ -520,16 +559,151 @@ def S_0288D4_STACK_SIZE(x: int) -> int:
 def build_shader_stub_evergreen_add() -> bytes:
   """Minimal placeholder program blob (not executable ALU yet).
 
-  Word0: CF_END-ish sentinel 0x00000000; rest NOP pad to 256B alignment unit.
+  Word0: CF_END-like sentinel 0x00000000; rest NOP pad to 256-byte alignment unit.
   Selftest only checks length/alignment + PM4; HW will need a real r600 binary.
   """
-  # 64 dwords = 256 bytes — one PGM unit
+  # 64 dwords = 256 bytes - one PGM unit
   words = [0x00000000] + [0x00000000] * 63
   return b"".join(struct.pack("<I", w) for w in words)
 
 ADD_SHADER = build_shader_stub_evergreen_add()
 OP = lambda x, y: x + y
 OP_NAME = "add"
+
+RV770_ADD_LL = pathlib.Path(__file__).with_name("rv770_add.ll")
+RV770_VS_LL = pathlib.Path(__file__).with_name("rv770_vs.ll")
+
+def r600_llc() -> str | None:
+  """Return an LLVM compiler with the legacy R600 backend, if installed."""
+  candidates = [os.environ.get("R600_LLC"), shutil.which("llc"),
+                "/opt/homebrew/opt/llvm/bin/llc"]
+  return next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
+
+def elf_text(elf: bytes, expected_size: int | None = None) -> bytes:
+  """Extract `.text` from LLVM's little-endian ELF32-AMDGPU object."""
+  if len(elf) < 52 or elf[:7] != b"\x7fELF\x01\x01\x01":
+    raise RuntimeError("LLVM did not produce a little-endian ELF32 R600 object")
+  shoff, = struct.unpack_from("<I", elf, 0x20)
+  shentsize, shnum, shstrndx = struct.unpack_from("<HHH", elf, 0x2e)
+  if shentsize != 40 or not shnum or shstrndx >= shnum or shoff + shnum * shentsize > len(elf):
+    raise RuntimeError("malformed ELF32 section table in R600 shader object")
+  def section(i: int) -> tuple[int, int, int]:
+    name, _, _, _, off, size, _, _, _, _ = struct.unpack_from("<IIIIIIIIII", elf, shoff + i * shentsize)
+    if off + size > len(elf):
+      raise RuntimeError("R600 shader section lies outside its ELF object")
+    return name, off, size
+  _, names_off, names_size = section(shstrndx)
+  names = elf[names_off:names_off + names_size]
+  for i in range(shnum):
+    name_off, off, size = section(i)
+    if name_off < len(names) and names[name_off:].split(b"\0", 1)[0] == b".text":
+      blob = elf[off:off + size]
+      if expected_size is not None and len(blob) != expected_size:
+        raise RuntimeError(f"unexpected R600 shader size {len(blob)} (want {expected_size})")
+      return blob
+  raise RuntimeError("R600 shader object has no .text section")
+
+def compile_rv770_add_shader() -> str:
+  """Compile the genuine RV770 pixel shader and prove its four ALU ADDs.
+
+  This produces assembly only; it never touches the GPU.  Binding the resulting
+  64-byte .text program to the RV770 graphics pipeline remains a separate,
+  explicit bring-up step.
+  """
+  llc = r600_llc()
+  if llc is None:
+    raise RuntimeError("no llc with the R600 backend; set R600_LLC=/path/to/llc")
+  if not RV770_ADD_LL.is_file():
+    raise RuntimeError(f"missing shader source: {RV770_ADD_LL}")
+  proc = subprocess.run(
+    [llc, "-march=r600", "-mcpu=rv770", "-filetype=asm", str(RV770_ADD_LL), "-o", "-"],
+    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+  )
+  if proc.returncode:
+    raise RuntimeError(f"R600 shader compile failed:\n{proc.stderr.strip()}")
+  asm = proc.stdout
+  if asm.count("ADD * T0.") != 4 or "EXPORT T0.XYZW" not in asm:
+    raise RuntimeError("compiled RV770 shader is missing its four ADDs or color export")
+  return asm
+
+def compile_rv770_add_blob() -> bytes:
+  """Return the executable 64-byte `.text` section for the RV770 ALU shader.
+
+  LLVM emits an ELF32-AMDGPU object.  Keeping extraction here makes the exact
+  program that was inspected by `--compile-rv770-add` available to the future
+  graphics draw path without checking an opaque generated blob into the tree.
+  """
+  llc = r600_llc()
+  if llc is None:
+    raise RuntimeError("no llc with the R600 backend; set R600_LLC=/path/to/llc")
+  proc = subprocess.run(
+    [llc, "-march=r600", "-mcpu=rv770", "-filetype=obj", str(RV770_ADD_LL), "-o", "-"],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+  )
+  if proc.returncode:
+    raise RuntimeError(f"R600 shader object compile failed:\n{proc.stderr.decode().strip()}")
+  return elf_text(proc.stdout, expected_size=64)
+
+def compile_rv770_vs_blob() -> bytes:
+  """Compile the matching RV770 VS (position, a, b exports) to executable text.
+
+  R700 fetch hardware reserves GPR0 for the vertex index and Mesa's fetch
+  shader deposits attributes in GPR1..3.  LLVM assigns entry arguments to
+  GPR0..2, so adjust only the three CF-export GPR fields after validating the
+  compiler's position/parameter export layout.  There are no ALU instructions
+  in this VS; this is an ABI relocation, not a change to shader arithmetic.
+  """
+  llc = r600_llc()
+  if llc is None or not RV770_VS_LL.is_file():
+    raise RuntimeError("missing R600 compiler or RV770 vertex shader source")
+  proc = subprocess.run([llc, "-march=r600", "-mcpu=rv770", "-filetype=obj", str(RV770_VS_LL), "-o", "-"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+  if proc.returncode:
+    raise RuntimeError(f"RV770 VS compile failed:\n{proc.stderr.decode().strip()}")
+  raw = elf_text(proc.stdout, expected_size=48)
+  words = list(struct.unpack("<12I", raw))
+  # `store.swizzle` produces POS(GPR0), PARAM0(GPR1), PARAM1(GPR2).
+  # type field is bits 13..14; exported source GPR is bits 15..21.
+  want_types = (1, 2, 2)
+  for word_index, source_gpr, typ in zip((2, 4, 6), (0, 1, 2), want_types):
+    word = words[word_index]
+    if ((word >> 13) & 3, (word >> 15) & 0x7F) != (typ, source_gpr):
+      raise RuntimeError("unexpected LLVM RV770 VS export layout")
+    words[word_index] = (word & ~(0x7F << 15)) | ((source_gpr + 1) << 15)
+  return struct.pack("<12I", *words)
+
+def build_rv770_vertex_fetch_blob() -> bytes:
+  """Build Mesa's RV770 vertex-fetch program for ``position, a, b``.
+
+  R700 does not fetch vertex attributes in the LLVM vertex shader.  Mesa emits
+  a small *fetch shader* at ``SQ_PGM_START_FS`` first; it reads resource 160
+  (the VS vertex-buffer resource bank) into GPRs 1, 2 and 3.  The LLVM VS then
+  receives those three vectors as T0, T1 and T2.  This is a direct Python
+  transcription of ``r600_bytecode_vtx_build`` and
+  ``r700_bytecode_cf_vtx_build`` for three RGBA32_FLOAT elements, not an
+  invented opaque blob.
+  """
+  # r700_sq.h: VTX word fields.  VFETCH opcode=0, FETCH_VERTEX_DATA=0,
+  # resource 160 (R600_FETCH_CONSTANTS_OFFSET_VS), src_gpr=0/index.x,
+  # mega_fetch_count=31, RGBA swizzle XYZW, FMT_32_32_32_32_FLOAT=0x23.
+  def vfetch(dst_gpr: int, offset: int) -> list[int]:
+    word0 = (160 << 8) | (0x1F << 26)
+    word1 = (dst_gpr << 0) | (0 << 9) | (1 << 12) | (2 << 15) | (3 << 18) | (0x23 << 22)
+    word2 = (offset & 0xFFFF) | (1 << 19)  # MEGA_FETCH
+    return [word0, word1, word2, 0]
+
+  # CF_OP_VTX is opcode 2 for R700.  R600's builder reserves three dwords then
+  # aligns a fetch clause to four dwords: with two CF records, fetch code begins
+  # at dword 8 => address 4 in 64-bit words.
+  # COUNT=2 describes its three four-dword VFETCH instructions.  The RET has
+  # no body and terminates the fetch program.
+  cf_vtx = [4, (2 << 23) | (2 << 10) | (1 << 31)]
+  cf_ret = [0, (21 << 23) | (1 << 21) | (1 << 31)]
+  words = cf_vtx + cf_ret + [0, 0, 0, 0] + vfetch(1, 0) + vfetch(2, 16) + vfetch(3, 32)
+  blob = struct.pack(f"<{len(words)}I", *words)
+  if len(blob) != 80:
+    raise AssertionError(f"RV770 fetch shader must be 80 bytes, got {len(blob)}")
+  return blob
 
 # =============================================================================
 # PM4 builders (Mesa evergreen_emit_cs_shader + evergreen_emit_dispatch)
@@ -559,9 +733,9 @@ class PM4Builder:
 
   def set_config_reg_seq(self, reg_byte: int, *values: int):
     off = (reg_byte - PACKET3_SET_CONFIG_REG_START) >> 2
-    n = len(values)  # PACKET3 count = n (reg + n values → count field = n)
+    n = len(values)  # PACKET3 count = n (reg + n values -> count field = n)
     # evergreend: PACKET3(op, n) where n = number of following dwords - 1
-    # set_config_reg_seq emits: header, offset, v0, v1, ... → following = 1+len
+    # set_config_reg_seq emits: header, offset, v0, v1, ... -> following = 1+len
     self.words.append(packet3(PKT3_SET_CONFIG_REG, len(values), compute=False))
     self.words.append(off & 0xFFFFFFFF)
     self.words.extend(int(v) & 0xFFFFFFFF for v in values)
@@ -570,13 +744,19 @@ class PM4Builder:
     off = (reg_byte - PACKET3_SET_CONTEXT_REG_START) >> 2
     if not (0 <= off < 0x400):
       raise ValueError(f"context reg {reg_byte:#x} off={off:#x} out of range")
-    self.pkt3(PKT3_SET_CONTEXT_REG, off, value, compute=True)
+    self.pkt3(PKT3_SET_CONTEXT_REG, off, value)
 
   def set_context_reg_seq(self, reg_byte: int, *values: int):
     off = (reg_byte - PACKET3_SET_CONTEXT_REG_START) >> 2
-    self.words.append(packet3(PKT3_SET_CONTEXT_REG, len(values), compute=True))
+    self.words.append(packet3(PKT3_SET_CONTEXT_REG, len(values), compute=self.compute))
     self.words.append(off & 0xFFFFFFFF)
     self.words.extend(int(v) & 0xFFFFFFFF for v in values)
+
+  def set_resource(self, index: int, *values: int):
+    """Emit one R600 resource descriptor (seven dwords)."""
+    if len(values) != 7:
+      raise ValueError(f"R600 resource needs 7 dwords, got {len(values)}")
+    self.pkt3(PKT3_SET_RESOURCE, index * 7, *values, compute=False)
 
   def emit_cs_shader(self, shader_gpu_addr: int, ngpr: int = 4, nstack: int = 1):
     """evergreen_emit_cs_shader: SQ_PGM_START_LS + RESOURCES (va >> 8)."""
@@ -607,15 +787,77 @@ class PM4Builder:
     self.words = []
     self.emit_cs_shader(shader_gpu_addr)
     self.emit_dispatch(block=block, grid=grid)
-    # Scratch markers (NOP payloads) — not executed as regs
+    # Scratch markers (NOP payloads) - not executed as regs
     self.pkt3(PKT3_NOP, lo32(out_va), hi32(out_va), compute=True)
     self.pkt3(PKT3_NOP, lo32(a_va), hi32(a_va), compute=True)
     self.pkt3(PKT3_NOP, lo32(b_va), hi32(b_va), compute=True)
     return self.words
 
+def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
+                         vertices_gpu: int, color_gpu: int) -> list[int]:
+  """Build the non-compute PM4 for one RV770 fullscreen-triangle add draw.
+
+  This is intentionally a pure builder so every dword can be reviewed with
+  ``--gpu-add-dry-run`` before hardware submission.  It contains no literal
+  result payload: the only result path is PS export -> CB_COLOR0 in AGP memory.
+  """
+  for name, addr in (("VS", vs_gpu), ("PS", ps_gpu), ("fetch", fetch_gpu),
+                     ("vertices", vertices_gpu), ("color", color_gpu)):
+    if addr & 0xFF:
+      raise ValueError(f"RV770 {name} address must be 256-byte aligned: {addr:#x}")
+  p = PM4Builder(compute=False)
+  # Mesa r600_init_atom_start_cs: establish a clean graphics context.
+  p.pkt3(PKT3_CONTEXT_CONTROL, 0x80000000, 0x80000000, compute=False)
+  p.set_config_reg(REG_VGT_PRIMITIVE_TYPE, RV770_DI_PT_TRILIST)
+  # r600_emit_vertex_buffers: resource bank VS=160; buffer is three 48-byte
+  # records.  The direct transport has no kernel relocation, hence the GPU
+  # aperture address is supplied in WORD0 rather than Mesa's reloc placeholder.
+  p.set_resource(RV770_FETCH_RESOURCE_VS,
+                 vertices_gpu, PAGE_SIZE - 1, 48 << 8, 0, 0, 0, 0xC0000000)
+  # Programs and their compiler-reported GPR requirements.  LLVM's VS inputs
+  # are fetch GPR 1/2/3; PS consumes the two interpolated parameter exports.
+  p.set_context_reg(REG_SQ_PGM_START_FS, fetch_gpu >> 8)
+  p.set_context_reg(REG_SQ_PGM_START_VS, vs_gpu >> 8)
+  # LLVM's .AMDGPU.config reports VS resources=0x103 (three GPRs, one stack
+  # entry) and PS resources=0x2 (two GPRs, no stack); do not guess clamps.
+  p.set_context_reg(REG_SQ_PGM_RESOURCES_VS, 4 | (1 << 8))
+  p.set_context_reg(REG_SQ_PGM_START_PS, ps_gpu >> 8)
+  p.set_context_reg_seq(REG_SQ_PGM_RESOURCES_PS, 2, 2)  # one color export
+  # Position plus two parameter exports, all four-component.  PARAM[0]/[1]
+  # have semantics 0/1 and feed the two PS arguments T0/T1.
+  p.set_context_reg(REG_SPI_VS_OUT_ID_0, 0 | (1 << 8))
+  p.set_context_reg(REG_SPI_VS_OUT_CONFIG, 1 << 1)
+  p.set_context_reg_seq(REG_SPI_PS_INPUT_CNTL_0, 0 | (1 << 12), 1 | (1 << 12))
+  p.set_context_reg_seq(REG_SPI_PS_IN_CONTROL_0, 2 | (1 << 29), 0)
+  # Convert the fullscreen triangle's NDC position to a single-pixel viewport.
+  p.set_context_reg(REG_PA_CL_VTE_CNTL, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 10))
+  half = struct.unpack("<I", struct.pack("<f", 0.5))[0]
+  p.set_context_reg_seq(REG_PA_CL_VPORT_XSCALE_0, half, half, half, half, half, half)
+  p.set_context_reg_seq(REG_PA_SC_WINDOW_SCISSOR_TL, 0, 1 | (1 << 16))
+  p.set_context_reg_seq(REG_PA_SC_GENERIC_SCISSOR_TL, 0, 1 | (1 << 16))
+  p.set_context_reg_seq(REG_PA_SC_VPORT_SCISSOR_0_TL, 0, 1 | (1 << 16))
+  # Explicit raster/CB defaults matter after a CP-only reset: without the R700
+  # viewport-scissor enable and bounds, all primitives can be clipped before PS.
+  p.set_context_reg(REG_PA_SU_SC_MODE_CNTL, 0)  # fill, no culling
+  p.set_context_reg(REG_PA_SU_VTX_CNTL, 1 | (2 << 1) | (5 << 3))
+  p.set_context_reg(REG_PA_SC_MODE_CNTL, (1 << 14) | (1 << 16) | (1 << 20) | (1 << 22))
+  # Linear RGBA32_FLOAT, no CMASK/FMASK.  COLOR0_BASE is in 256-byte units.
+  color_info = (RV770_COLOR_32_32_32_32_FLOAT << 2) | (7 << 12) | (1 << 24)
+  p.set_context_reg(REG_CB_COLOR0_BASE, color_gpu >> 8)
+  p.set_context_reg(REG_CB_COLOR0_SIZE, 0)
+  p.set_context_reg(REG_CB_COLOR0_VIEW, 0)
+  p.set_context_reg(REG_CB_COLOR0_INFO, color_info)
+  p.set_context_reg(REG_CB_COLOR0_MASK, 0)
+  p.set_context_reg_seq(REG_CB_TARGET_MASK, 0xF, 0xF)
+  p.set_context_reg(REG_CB_BLEND0_CONTROL, 0)
+  p.set_context_reg(REG_CB_BLEND_CONTROL, 0)
+  p.set_context_reg(REG_CB_COLOR_CONTROL, 0)
+  p.pkt3(PKT3_DRAW_INDEX_AUTO, 3, RV770_DI_SRC_SEL_AUTO_INDEX, compute=False)
+  return p.words
+
 def build_cp_resume_regs(ring_gpu_addr: int, ring_size: int = 0x10000,
                          wb_gpu_addr: int = 0) -> list[tuple[int, int]]:
-  """Ordered MMIO writes mirroring r600_cp_resume (r600.c) — for dry-run dump.
+  """Ordered MMIO writes mirroring r600_cp_resume (r600.c) - for dry-run dump.
 
   Returns [(reg_byte, value), ...]. Does not touch hardware.
   """
@@ -645,7 +887,7 @@ def build_cp_resume_regs(ring_gpu_addr: int, ring_size: int = 0x10000,
 
 def build_me_initialize(family: str, max_hw_contexts: int = 8) -> list[int]:
   """r600_cp_start ME_INITIALIZE packet (ring contents)."""
-  # r600.c: family >= CHIP_RV770 → contexts path
+  # r600.c: family >= CHIP_RV770 -> contexts path
   words = [
     packet3(PKT3_ME_INITIALIZE, 5, compute=False),
     0x1,
@@ -672,7 +914,7 @@ REG_CP_ME_RAM_WADDR = 0xC15C
 REG_CP_PFP_UCODE_ADDR = 0xC150
 REG_CP_PFP_UCODE_DATA = 0xC154
 REG_SCRATCH_REG0 = 0x8500
-# RV770 MC regs are at 0x202x (rv770d.h) — NOT R600's 0x218x.
+# RV770 MC regs are at 0x2024 (rv770d.h) - NOT R600's 0x2180.
 REG_MC_VM_FB_LOCATION = 0x2024
 REG_MC_VM_AGP_TOP = 0x2028
 REG_MC_VM_AGP_BOT = 0x202C
@@ -696,7 +938,7 @@ REG_VM_L2_CNTL2 = 0x1404
 REG_VM_L2_CNTL3 = 0x1408
 REG_VM_CONTEXT0_CNTL = 0x1410
 REG_CONFIG_MEMSIZE = 0x5428
-R700_MC_CITF_CNTL = 0x25c0          # r600_reg.h — MC blackout control
+R700_MC_CITF_CNTL = 0x25c0          # r600_reg.h - MC blackout control
 R600_BIF_FB_EN = 0x5490
 R600_BLACKOUT_MASK = 0x3
 R600_FB_READ_EN = 1 << 0
@@ -768,7 +1010,7 @@ def diagnose_host() -> str:
   if amd:
     lines.append("host PCI AMD: " + ", ".join(f"{n} {v:04x}:{d:04x}" for n, v, d in amd))
   else:
-    lines.append("host PCI: no AMD (1002:*) device — GPU not enumerated")
+    lines.append("host PCI: no AMD (1002:*) device - GPU not enumerated")
   if bridges:
     lines.append("host PCIe bridges (dock?): " +
                  ", ".join(f"{v:04x}:{d:04x}" for _, v, d in bridges[:6]))
@@ -779,7 +1021,7 @@ def fetch_radeon_fw(name: str) -> bytes:
   return fetch_fw("radeon", name)
 
 class TerrascaleDevice:
-  """TinyGPU + R700 (HD 4850) CP bring-up. VRAM BAR0 dead → AGP/sysmem rings."""
+  """TinyGPU + R700 (HD 4850) CP bring-up. VRAM BAR0 dead -> AGP/sysmem rings."""
 
   def __init__(self, chip: ChipInfo | None = None, wait_s: float = 0.0):
     self.chip = chip
@@ -803,8 +1045,6 @@ class TerrascaleDevice:
         print(f"warning: unknown AMD did={self.did:04x}; using {self.chip.name}",
               file=sys.stderr)
     self.map_mmio()
-    with contextlib.suppress(Exception):
-      self.vram = self.pci.map_bar(0)
     if OSX and getenv("AMD_BOOT_MASK_INTERRUPTS", 1):
       with contextlib.suppress(Exception):
         masked = self.pci.mask_msi()
@@ -841,7 +1081,7 @@ class TerrascaleDevice:
         if vid == PCI_VID_AMD:
           return vid, did
         if vid == 0xFFFF and getenv("AMD_EGPU_RESTART_SERVER", 1):
-          print("terrascale: pci=0xffff — restarting TinyGPU server", flush=True)
+          print("terrascale: pci=0xffff - restarting TinyGPU server", flush=True)
           self.pci.restart_server()
           time.sleep(1.5)
           vid, did = self._read_ids(retries=8, delay_s=0.4)
@@ -851,7 +1091,7 @@ class TerrascaleDevice:
           raise RuntimeError(f"no AMD GPU (pci={vid:04x}:{did:04x})\n{diagnose_host()}")
       except RuntimeError as e:
         if "Driver not available" in str(e) and time.time() < deadline:
-          print("terrascale: waiting for GPU…", flush=True)
+          print("terrascale: waiting for GPU...", flush=True)
           time.sleep(2.0)
           continue
         raise
@@ -868,6 +1108,18 @@ class TerrascaleDevice:
       except Exception:
         continue
     raise RuntimeError("no suitable MMIO BAR")
+
+  def map_vram(self):
+    """Map BAR0 only for an explicit VRAM diagnostic/access operation.
+
+    On this eGPU the local GDDR3 path currently returns a stable floating-bus
+    value and some BIF/BAR0 experiments can wedge the MC.  The normal CP/AGP
+    add path has no dependency on BAR0, so keeping this lazy makes that
+    separation enforceable rather than merely conventional.
+    """
+    if self.vram is None:
+      self.vram = self.pci.map_bar(0)
+    return self.vram
 
   def rreg(self, byte_off: int) -> int:
     if self.mmio is None:
@@ -901,10 +1153,10 @@ class TerrascaleDevice:
   def program_agp(self):
     """Program MC AGP aperture so host DMA addrs are GPU-reachable.
 
-    R700 AGP_TOP/BOT are 16-bit (mc_addr >> 16). RV770 regs are rv770d.h 0x202x.
-    AGP_BASE=0 → host_dma = mc_addr.
+    R700 AGP_TOP/BOT are 16-bit (mc_addr >> 16). RV770 regs are rv770d.h 0x2024 family.
+    AGP_BASE=0 -> host_dma = mc_addr.
 
-    Critical: do NOT leave FB_LOCATION at 0 while AGP also covers 0 — CP ring
+    Critical: do NOT leave FB_LOCATION at 0 while AGP also covers 0 - CP ring
     fetches then hit dead FB (zeros) instead of host. Park a stub FB high and
     keep AGP on the low DMA range (rv770_mc_program non-overlap).
     """
@@ -917,9 +1169,15 @@ class TerrascaleDevice:
       for off in (0, 4, 8, 12, 16):
         with contextlib.suppress(Exception):
           self.wreg(base + off, 0)
-    # Stub FB at 0xE0000000–0xE0FFFFFF (16MB) — unused; keeps AGP/FB disjoint.
-    fb_start_24 = 0xE0
-    fb_end_24 = 0xE0
+    # Stub FB at 0xE0000000-0xE0FFFFFF (16MB) - unused; keeps AGP/FB disjoint.
+    stub_mb = int(os.environ.get("AMD_BOOT_STUB_FB_MB", "16"))
+    fb_start_24 = int(os.environ.get("AMD_BOOT_STUB_FB_START", "0xE0"), 0) & 0xFF
+    fb_end_24 = fb_start_24 + max(0, (stub_mb >> 4) - 1)  # 16MB blocks in >>24 units
+    if stub_mb <= 16:
+      fb_end_24 = fb_start_24
+    # ATOM leaves CONFIG_MEMSIZE=1GB; shrink so MC does not treat 0-1GB as local FB
+    # while AGP owns those addresses (device->host then returns default-page zeros).
+    self.wreg(REG_CONFIG_MEMSIZE, stub_mb << 20)
     self.wreg(REG_MC_VM_FB_LOCATION, (fb_end_24 << 16) | fb_start_24)
     self.wreg(REG_MC_VM_SYSTEM_APERTURE_LOW, self.agp_start >> 12)
     self.wreg(REG_MC_VM_SYSTEM_APERTURE_HIGH, self.agp_end >> 12)
@@ -933,24 +1191,29 @@ class TerrascaleDevice:
     self.agp_enable()
     # VBIOS leaves MC blacked out (CITF & 3 == 3). Without clearing, AGP/host
     # fetches return zeros and CP rptr advances on fake PACKET0s. Only clear
-    # blackout — do NOT poke BIF_FB_EN until VRAM is trained (can hang MC).
+    # blackout - do NOT poke BIF_FB_EN until VRAM is trained (can hang MC).
     citf = self.rreg(R700_MC_CITF_CNTL)
     if citf != 0xFFFFFFFF and (citf & R600_BLACKOUT_MASK):
       self.wreg(R700_MC_CITF_CNTL, citf & ~R600_BLACKOUT_MASK)
       time.sleep(0.001)
       citf2 = self.rreg(R700_MC_CITF_CNTL)
       if DEBUG:
-        print(f"terrascale: MC blackout {citf:#x} → {citf2:#x}", flush=True)
+        print(f"terrascale: MC blackout {citf:#x} -> {citf2:#x}", flush=True)
       if citf2 == 0xFFFFFFFF:
-        raise RuntimeError("MC hung after clearing blackout — power-cycle the eGPU dock")
-    if DEBUG:
-      top, bot = self.rreg(REG_MC_VM_AGP_TOP), self.rreg(REG_MC_VM_AGP_BOT)
-      fb = self.rreg(REG_MC_VM_FB_LOCATION)
-      print(f"terrascale: AGP MC {self.agp_start:#x}-{self.agp_end:#x} "
-            f"(TOP={top:#x} BOT={bot:#x}) FB_LOC={fb:#x}", flush=True)
+        raise RuntimeError("MC hung after clearing blackout - power-cycle the eGPU dock")
+    # ATOM enables BIF_FB_EN; leave it off for AGP-only bring-up (BAR0 poke hangs).
+    if not getenv("AMD_BOOT_ENABLE_BIF", 0):
+      self.wreg(R600_BIF_FB_EN, 0)
+    top, bot = self.rreg(REG_MC_VM_AGP_TOP), self.rreg(REG_MC_VM_AGP_BOT)
+    fb = self.rreg(REG_MC_VM_FB_LOCATION)
+    memsz = self.rreg(REG_CONFIG_MEMSIZE)
+    bif = self.rreg(R600_BIF_FB_EN)
+    print(f"terrascale: AGP MC {self.agp_start:#x}-{self.agp_end:#x} "
+          f"(TOP={top:#x} BOT={bot:#x}) FB_LOC={fb:#x} MEMSIZE={memsz:#x} BIF={bif:#x}",
+          flush=True)
 
   def agp_enable(self):
-    """rv770_agp_enable — L2 + L1 TLB pass-through, VM contexts off."""
+    """rv770_agp_enable - L2 + L1 TLB pass-through, VM contexts off."""
     self.wreg(REG_VM_L2_CNTL,
               ENABLE_L2_CACHE | ENABLE_L2_FRAGMENT_PROCESSING |
               ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE | EFFECTIVE_L2_QUEUE_SIZE(7))
@@ -993,7 +1256,7 @@ class TerrascaleDevice:
     self.wreg(REG_SCRATCH_UMSK, 0)
 
   def load_cp_fw(self):
-    """rv770_cp_load_microcode — big-endian words in RV770_{pfp,me}.bin."""
+    """rv770_cp_load_microcode - big-endian words in RV770_{pfp,me}.bin."""
     pfp = fetch_radeon_fw("RV770_pfp.bin")
     me = fetch_radeon_fw("RV770_me.bin")
     if len(pfp) != R700_PFP_UCODE_SIZE * 4:
@@ -1006,7 +1269,7 @@ class TerrascaleDevice:
     _ = self.rreg(REG_GRBM_SOFT_RESET)
     time.sleep(0.015)
     self.wreg(REG_GRBM_SOFT_RESET, 0)
-    # PFP — be32 in file
+    # PFP - be32 in file
     self.wreg(REG_CP_PFP_UCODE_ADDR, 0)
     for i in range(R700_PFP_UCODE_SIZE):
       self.wreg(REG_CP_PFP_UCODE_DATA, struct.unpack_from(">I", pfp, i * 4)[0])
@@ -1088,7 +1351,7 @@ class TerrascaleDevice:
     self.cp_start()
 
   def ring_test(self, timeout_s: float = 2.0) -> bool:
-    """r600_ring_test: SET_CONFIG_REG scratch ← 0xDEADBEEF."""
+    """r600_ring_test: SET_CONFIG_REG scratch <- 0xDEADBEEF."""
     scratch = REG_SCRATCH_REG0
     self.wreg(scratch, 0xCAFEDEAD)
     off = (scratch - PACKET3_SET_CONFIG_REG_START) >> 2
@@ -1111,7 +1374,7 @@ class TerrascaleDevice:
     print(f"terrascale: ring_test FAIL scratch={got:#x} "
           f"rptr={rptr:#x} wptr={self.wptr:#x}", flush=True)
     if rptr == self.wptr and got == 0xCAFEDEAD:
-      print("terrascale: hint — CP consumed dwords but scratch unchanged; "
+      print("terrascale: hint - CP consumed dwords but scratch unchanged; "
             "often means ring fetch saw zeros (MC blackout / AGP/FB overlap / "
             "no host DMA). Check CITF blackout and AGP vs FB_LOCATION.", flush=True)
     return False
@@ -1139,7 +1402,7 @@ class TerrascaleDevice:
     dest = path or DEFAULT_VBIOS
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(bios)
-    print(f"terrascale: dumped VBIOS {len(bios)}B → {dest}", flush=True)
+    print(f"terrascale: dumped VBIOS {len(bios)}B -> {dest}", flush=True)
     return bios
 
   def clear_mc_blackout(self):
@@ -1148,14 +1411,14 @@ class TerrascaleDevice:
       self.wreg(R700_MC_CITF_CNTL, citf & ~R600_BLACKOUT_MASK)
       time.sleep(0.001)
       if self.rreg(R700_MC_CITF_CNTL) == 0xFFFFFFFF:
-        raise RuntimeError("MC hung after clearing blackout — power-cycle the eGPU dock")
+        raise RuntimeError("MC hung after clearing blackout - power-cycle the eGPU dock")
 
   def prepare_spll_refclk(self) -> dict:
     """Best-effort SPLL reference clock setup before ATOM (R700 / eGPU).
 
-    Discrete RV770 normally uses onboard XTAL (CG_CLKPIN_CNTL). On TB eGPU,
-    SPLL_CHG_STATUS often never asserts — try XTAL path and SI-style BIF refclk
-    bits (may be no-ops on R700). Returns a status dict for diagnostics.
+    Cold-boot HD 4850 often already has SPLL_CHG (STATUS~=0x86, CLKPIN~=0x206).
+    Do NOT force BCLK_AS_XCLK in that case - poking CLKPIN can kill CHG, and
+    CLKPIN=0x207 has hung MC (pci=ffff) on this eGPU. Returns diagnostics.
     """
     CG_CLKPIN_CNTL = 0x660
     CG_CLKPIN_CNTL_2 = 0x664  # SI; may be unused on RV770
@@ -1167,17 +1430,36 @@ class TerrascaleDevice:
 
     pin = self.rreg(CG_CLKPIN_CNTL)
     pin2 = self.rreg(CG_CLKPIN_CNTL_2)
-    # Prefer raw XTALIN (no /4, no TCLK mux)
-    self.wreg(CG_CLKPIN_CNTL, (pin | BCLK_AS_XCLK) & ~(MUX_TCLK_TO_XCLK | XTALIN_DIVIDE))
-    # SI-era: force BIF/PCIe refclk into clock pin block (harmless if RAZ on R700)
+    st0 = self.rreg(REG_CG_SPLL_STATUS)
+    chg0 = bool(st0 & SPLL_CHG_STATUS)
+
+    if chg0:
+      # Already locked - leave CLKPIN alone.
+      info = {
+        "clkpin_before": pin, "clkpin_after": pin,
+        "clkpin2_before": pin2, "clkpin2_after": pin2,
+        "spll_status": st0, "chg": True, "poked": False,
+      }
+      if DEBUG:
+        print(f"terrascale: SPLL already CHG STATUS={st0:#x} CLKPIN={pin:#x}",
+              flush=True)
+      return info
+
+    # Prefer raw XTALIN (no /4, no TCLK mux). Keep existing BCLK_AS_XCLK if set;
+    # do not invent new CLKPIN values (0x207 hung this card).
+    new_pin = pin & ~(MUX_TCLK_TO_XCLK | XTALIN_DIVIDE)
+    if os.environ.get("AMD_SPLL_FORCE_BCLK", "0") == "1":
+      new_pin |= BCLK_AS_XCLK
+    self.wreg(CG_CLKPIN_CNTL, new_pin)
     self.wreg(CG_CLKPIN_CNTL_2, pin2 | FORCE_BIF_REFCLK_EN)
 
-    # Request an SPLL mux update and see if CHG ever asserts
     f2 = self.rreg(0x604)
-    self.wreg(0x604, (f2 & ~0x1FF) | 1 | SCLK_MUX_UPDATE)
+    self.wreg(0x604, (f2 & ~0x1FF) | (f2 & 0x1FF) | SCLK_MUX_UPDATE)
     chg = False
-    for _ in range(50):
+    for _ in range(100):
       st = self.rreg(REG_CG_SPLL_STATUS)
+      if st == 0xFFFFFFFF:
+        raise RuntimeError("MC hung during SPLL probe - power-cycle eGPU")
       if st & SPLL_CHG_STATUS:
         chg = True
         break
@@ -1190,20 +1472,22 @@ class TerrascaleDevice:
       "clkpin2_after": self.rreg(CG_CLKPIN_CNTL_2),
       "spll_status": self.rreg(REG_CG_SPLL_STATUS),
       "chg": chg,
+      "poked": True,
     }
     if DEBUG or not chg:
       print(f"terrascale: SPLL refclk probe CHG={chg} "
             f"STATUS={info['spll_status']:#x} "
-            f"CLKPIN {pin:#x}→{info['clkpin_after']:#x} "
-            f"CLKPIN2 {pin2:#x}→{info['clkpin2_after']:#x}", flush=True)
+            f"CLKPIN {pin:#x}->{info['clkpin_after']:#x} "
+            f"CLKPIN2 {pin2:#x}->{info['clkpin2_after']:#x}", flush=True)
     return info
 
   def atom_asic_init(self, bios: bytes | None = None) -> None:
-    """Run ATOM ASIC_Init via examples_egpu/neural.py (dword index → byte*4).
+    """Run ATOM ASIC_Init via examples_egpu/neural.py (dword index -> byte*4).
 
-    On this TB eGPU, CG_SPLL_STATUS.SPLL_CHG_STATUS never asserts, so ATOM's
-    SPLL wait is satisfied by synthesizing bit1 on dword index 0x183 reads.
-    Do NOT poke BIF_FB_EN here — let ATOM own it.
+    HD 4850 eGPU: cold boot has real SPLL_CHG (STATUS~=0x86). ASIC_Init SetEngineClock
+    then reprograms SPLL and waits for CHG which never returns - use JUMP_BAIL to
+    fall through (keeps cold-boot MPLL CLKF). Do NOT default-synth SPLL_CHG: that
+    makes VBIOS write MPLL_AD CLKF=0 and kills BAR0. Do NOT poke BIF_FB_EN here.
     """
     egpu = pathlib.Path(__file__).resolve().parents[1] / "examples_egpu"
     if str(egpu) not in sys.path:
@@ -1219,13 +1503,26 @@ class TerrascaleDevice:
     if not nl.check_atom_bios(bios):
       raise RuntimeError("ATOM BIOS header check failed")
     self.clear_mc_blackout()
-    self.prepare_spll_refclk()
+    spll_info = self.prepare_spll_refclk()
+    real_chg = bool(spll_info.get("chg"))
+    # Synth only on explicit opt-in. Fake CHG -> VBIOS programs MPLL CLKF=0.
+    synth = os.environ.get("AMD_ATOM_SYNTH_SPLL_CHG", "0") == "1"
+    if not real_chg and not synth:
+      raise RuntimeError(
+        "SPLL_CHG_STATUS=0 - need cold power-cycle/replug for real SPLL lock, "
+        "or set AMD_ATOM_SYNTH_SPLL_CHG=1 (unsafe: leaves MPLL CLKF=0)")
+    if synth and not real_chg:
+      print("terrascale: WARNING synth SPLL_CHG "
+            "(expect MPLL CLKF=0 / dead BAR0)", flush=True)
     os.environ.setdefault("AMD_ATOM_QUIET", "1")
     os.environ.setdefault("AMD_ATOM_JUMP_MAX", "200000")
-    # JUMP_BAIL=1: eGPU SPLL never locks; without bail, long waits can hang MC
-    # (pci=ffff). SPLL_CHG is still synthesized below so most waits exit cleanly.
+    # eGPU: SetEngineClock reprograms SPLL then waits for CHG which never
+    # re-asserts. Prefer JUMP_BAIL (fall through) over synth - keeps cold-boot
+    # MPLL CLKF and lets ASIC_Init continue into SetMemoryClock.
     os.environ.setdefault("AMD_ATOM_JUMP_BAIL", "1")
-    os.environ.setdefault("AMD_ATOM_JUMP_TIMEOUT_SEC", "15")
+    os.environ.setdefault("AMD_ATOM_JUMP_TIMEOUT_SEC", "8")
+    # Do not enable full op trace via DEBUG - AtomCard(debug=True) floods.
+    # Bail messages still print when AMD_ATOM_TRACE=1.
 
     class BootAdapter:
       def __init__(self, d: "TerrascaleDevice"): self.dev = d; self._wcount = 0
@@ -1234,10 +1531,10 @@ class TerrascaleDevice:
       def wreg(self, reg: int, val: int):
         self.dev.wreg((reg & 0xFFFF) * 4, val & 0xFFFFFFFF)
         self._wcount += 1
-        # Some regs RAZ as 0xffffffff — only trust PCI vid for liveness.
+        # Some regs RAZ as 0xffffffff - only trust PCI vid for liveness.
         if (self._wcount & 0x3F) == 0:
           if self.dev.pci.read_config(0, 2) == 0xFFFF:
-            raise RuntimeError("PCI vid=ffff mid-ATOM — power-cycle eGPU")
+            raise RuntimeError("PCI vid=ffff mid-ATOM - power-cycle eGPU")
       def mmio_sync_safe(self):
         with contextlib.suppress(Exception):
           _ = self.dev.rreg(REG_CONFIG_MEMSIZE)
@@ -1246,17 +1543,93 @@ class TerrascaleDevice:
         time.sleep(0.05)
 
     class R700AtomCard(nl.AtomCard):
+      def __init__(self, boot, debug=False, synth_chg=False):
+        super().__init__(boot, debug=debug)
+        self._synth_chg = synth_chg
       def reg_read(self, reg: int) -> int:
         reg = self._mmio_reg(reg)
         val = super().reg_read(reg)
-        if reg == 0x183:  # CG_SPLL_STATUS
+        if self._synth_chg and reg == 0x183:  # CG_SPLL_STATUS
           val |= SPLL_CHG_STATUS
         return val
 
     boot = BootAdapter(self)
-    card = R700AtomCard(boot, debug=bool(DEBUG))
+    card = R700AtomCard(boot, debug=False, synth_chg=synth)
     ctx = nl.parse_atom_context(bios)
     exe = nl.AtomExecutor(ctx, card)
+    # Default OFF: skipping SetMemoryClock leaves MC_SEQ/AGP broken on this ROM
+    # (MISC0 stuck, ring fetch zeros). Full ASIC_Init + MPLL repair is required
+    # for AGP smoke; VRAM still needs a safer SetMemoryClock strategy later.
+    skip_mclk = os.environ.get("AMD_ATOM_SKIP_SET_MCLK", "0") == "1"
+    if skip_mclk:
+      import types
+      _orig_locked = type(exe)._execute_locked
+      def _locked_skip(self_exe, index, ps, ps_size=16):
+        if index == 11:
+          print("terrascale: ASIC_Init skip SetMemoryClock (AMD_ATOM_SKIP_SET_MCLK)",
+                flush=True)
+          return 0
+        return _orig_locked(self_exe, index, ps, ps_size)
+      exe._execute_locked = types.MethodType(_locked_skip, exe)  # type: ignore[method-assign]
+    # Optional: patch MPLL during ASIC_Init so training sees live CLKF.
+    # Default OFF. Cold CHG+PATCH: CLKF stays 73 but MISC0 becomes 0x320aa06a
+    # (not 0x3000422a), STATUS_M=0, AGP ring fails; BIF then hangs MC.
+    # Unpatched + post-hoc repair keeps AGP; VRAM still float until better train.
+    patch_mpll = os.environ.get("AMD_ATOM_PATCH_MPLL", "0") == "1"
+    patched_mpll = {"n": 0}
+    if patch_mpll and not skip_mclk:
+      mclk_target = 99300
+      with contextlib.suppress(Exception):
+        hwi0 = nl._u16(bios, ctx.data_table + nl.ATOM_DATA_FWI_PTR)
+        mclk_target = nl._u32(bios, hwi0 + nl.ATOM_FWI_DEFMCLK_PTR) or 99300
+      good_ad = self._calc_mpll_ad(mclk_target)
+      MPLL_AD_I, MPLL_DQ_I = 0x189, 0x18B  # byte 0x624, 0x62c
+      orig_wreg = boot.wreg
+
+      def wreg_patch(reg: int, val: int):
+        reg &= 0xFFFF
+        val &= 0xFFFFFFFF
+        if reg in (MPLL_AD_I, MPLL_DQ_I) and (val & 0x7F) == 0:
+          patched_mpll["n"] += 1
+          val = good_ad
+        orig_wreg(reg, val)
+
+      boot.wreg = wreg_patch  # type: ignore[method-assign]
+      print(f"terrascale: ASIC_Init MPLL patch ON (target MCLK={mclk_target} "
+            f"AD={good_ad:#x})", flush=True)
+    # Better than PATCH_MPLL: let MemoryPLLInit write CLKF=0 (VBIOS power-up
+    # window), then repair MPLL before ResetMemoryDLL/MemoryTraining/DeviceInit.
+    # Default ON — Linux never does this (assumes VBIOS leaves DRAM live); on
+    # eGPU post-hoc-only repair leaves training at CLKF=0.
+    repair_after_mplli = (
+      os.environ.get("AMD_ATOM_REPAIR_AFTER_MPLLINIT", "1") == "1"
+      and not skip_mclk and not patch_mpll
+    )
+    repair_after_n = {"n": 0}
+    if repair_after_mplli:
+      import types
+      _orig_locked2 = type(exe)._execute_locked
+      mclk_target = 99300
+      with contextlib.suppress(Exception):
+        hwi0 = nl._u16(bios, ctx.data_table + nl.ATOM_DATA_FWI_PTR)
+        mclk_target = nl._u32(bios, hwi0 + nl.ATOM_FWI_DEFMCLK_PTR) or 99300
+
+      def _locked_repair_after(self_exe, index, ps, ps_size=16):
+        ret = _orig_locked2(self_exe, index, ps, ps_size)
+        # MemoryPLLInit = cmd 16
+        if index == 16:
+          ad = self.rreg(0x624)
+          if (ad & 0x7F) == 0:
+            repair_after_n["n"] += 1
+            print("terrascale: post-MemoryPLLInit MPLL repair (CLKF was 0)",
+                  flush=True)
+            self.repair_mpll_boot_clock(mclk_target)
+            self._wake_mrdck()
+        return ret
+
+      exe._execute_locked = types.MethodType(_locked_repair_after, exe)  # type: ignore
+      print("terrascale: ASIC_Init will repair MPLL after MemoryPLLInit",
+            flush=True)
     hwi = nl._u16(bios, ctx.data_table + nl.ATOM_DATA_FWI_PTR)
     ps = [0] * 16
     ps[0] = nl._u32(bios, hwi + nl.ATOM_FWI_DEFSCLK_PTR)
@@ -1268,11 +1641,91 @@ class TerrascaleDevice:
     mem = self.rreg(REG_CONFIG_MEMSIZE)
     misc0 = self.rreg(REG_MC_SEQ_MISC0)
     spll = self.rreg(REG_CG_SPLL_STATUS)
-    print(f"terrascale: ATOM done writes={ctx.reg_write_count} "
+    mpll_ad = self.rreg(0x624)
+    clkf = mpll_ad & 0x7F
+    patch_note = f" patched_mpll={patched_mpll['n']}" if patch_mpll and not skip_mclk else ""
+    if repair_after_mplli:
+      patch_note += f" repair_after_mplli={repair_after_n['n']}"
+    print(f"terrascale: ATOM done writes={boot._wcount} "
           f"MEMSIZE={mem:#x} ({mem >> 20}MB) MISC0={misc0:#x} "
           f"SPLL_STATUS={spll:#x} CHG={bool(spll & SPLL_CHG_STATUS)} "
-          f"t={time.time() - t0:.1f}s", flush=True)
-    self._wake_mrdck()
+          f"MPLL_AD={mpll_ad:#x} CLKF={clkf} skip_mclk={int(skip_mclk)} "
+          f"t={time.time() - t0:.1f}s{patch_note}", flush=True)
+    # With skip_mclk, cold-boot CLKF (often 50) should remain. Only repair if 0.
+    if clkf == 0 or os.environ.get("AMD_ATOM_FORCE_MPLL_REPAIR", "0") == "1":
+      if clkf == 0:
+        print("terrascale: WARNING MPLL CLKF=0 after ATOM - repairing via calc",
+              flush=True)
+      self.repair_mpll_boot_clock()
+      clkf = self.rreg(0x624) & 0x7F
+    if clkf != 0 and os.environ.get("AMD_ATOM_WAKE_MRDCK", "1") == "1":
+      self._wake_mrdck()
+    elif DEBUG:
+      print(f"terrascale: skip MRDCK wake (CLKF={clkf})", flush=True)
+    # Optional: MemoryDeviceInit (cmd 72) — end of SetMemoryClock in full ASIC_Init
+    # restores MC_SEQ_MISC0 to 0x3000422a. Standalone SetMemoryClock can leave
+    # MC_SEQ wedged (MISC0 stuck/floating). Keep BIF off afterward.
+    if clkf != 0 and os.environ.get("AMD_ATOM_MEMORY_DEVICE_INIT", "0") == "1":
+      try:
+        self.atom_run_cmd(72, "MemoryDeviceInit", 0)
+        self.ensure_mpll_alive()
+        self.wreg(R600_BIF_FB_EN, 0)
+        print(f"terrascale: after MemoryDeviceInit MISC0={self.rreg(REG_MC_SEQ_MISC0):#x} "
+              f"BIF={self.rreg(R600_BIF_FB_EN):#x}", flush=True)
+      except Exception as e:
+        print(f"terrascale: MemoryDeviceInit warning: {e}", flush=True)
+        self.ensure_mpll_alive()
+        self.wreg(R600_BIF_FB_EN, 0)
+    # finish_memory (ResetMemoryDLL/…) defaults OFF — can wedge MC_SEQ on eGPU.
+    if clkf != 0 and os.environ.get("AMD_ATOM_FINISH_MEM", "0") == "1":
+      try:
+        self.finish_memory_after_mpll()
+      except Exception as e:
+        print(f"terrascale: finish_memory warning: {e}", flush=True)
+        self.ensure_mpll_alive()
+
+  def repair_mpll_boot_clock(self, mclk_10khz: int = 99300) -> int:
+    """Program MPLL_AD/DQ for GDDR3 boot MCLK when ATOM left CLKF=0.
+
+    Uses Linux rv770 fractional MPLL formula with ref=27 MHz, ref_div=1,
+    post_div=1 (fits CLKF in 7 bits for ~993 MHz). Does not touch BIF.
+    Returns programmed CLKF.
+    """
+    ref = 2700  # 27 MHz in 10 kHz units
+    ref_div, post_div = 1, 1
+    fyclk = (mclk_10khz * 4) // 2  # GDDR3
+    fb8 = (8 * fyclk * ref_div * post_div) // ref
+    clkf, clkfrac = fb8 // 8, fb8 % 8
+    if clkf > 0x7F:
+      raise RuntimeError(f"MPLL CLKF {clkf} exceeds 7 bits - adjust post_div")
+    # rv770_map_clkf_to_ibias
+    if clkf <= 0x10: ibias = 0x4B
+    elif clkf <= 0x19: ibias = 0x5B
+    elif clkf <= 0x21: ibias = 0x2B
+    elif clkf <= 0x27: ibias = 0x6C
+    elif clkf <= 0x31: ibias = 0x9D
+    else: ibias = 0xC6
+    enc_ref = [0, 16, 17, 20, 21][ref_div - 1]
+    ypost = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[post_div]
+    ad = ((clkf & 0x7F) | ((enc_ref & 0x1F) << 7) | ((clkfrac & 0x1F) << 12) |
+          ((ypost & 3) << 17) | ((ibias & 0x3FF) << 20) | (1 << 31))
+    # Hold RESET_EN while programming, then release
+    ad2 = (self.rreg(0x628) | (1 << 25) | (1 << 24)) & ~(1 << 29)
+    dq2 = (self.rreg(0x630) | (1 << 25) | (1 << 24)) & ~(1 << 29)
+    self.wreg(0x628, ad2)
+    self.wreg(0x630, dq2)
+    self.wreg(0x624, ad)
+    self.wreg(0x62c, ad)
+    time.sleep(0.01)
+    self.wreg(0x628, (ad2 & ~(1 << 25)) | (1 << 24))
+    self.wreg(0x630, (dq2 & ~(1 << 25)) | (1 << 24))
+    time.sleep(0.02)
+    if self.pci.read_config(0, 2) == 0xFFFF:
+      raise RuntimeError("MC hung during MPLL repair - power-cycle eGPU")
+    got = self.rreg(0x624)
+    print(f"terrascale: MPLL repair AD={got:#x} CLKF={got & 0x7F} "
+          f"(target {clkf} for MCLK={mclk_10khz / 100:.0f}MHz)", flush=True)
+    return got & 0x7F
 
   def _wake_mrdck(self):
     """Clear MRDCK SLEEP/RESET left set by incomplete ATOM memory bring-up.
@@ -1290,22 +1743,402 @@ class TerrascaleDevice:
     self.wreg(0x648, base)
     m2 = self.rreg(0x648)
     if DEBUG:
-      print(f"terrascale: MRDCK wake MCLK {mclk:#x} → {m2:#x} "
+      print(f"terrascale: MRDCK wake MCLK {mclk:#x} -> {m2:#x} "
             f"(was SLEEP={sleep:#x} RESET={reset:#x})", flush=True)
 
-  def probe_bar0(self) -> bool:
-    """Return True if BAR0 write/readback sticks (VRAM usable from host)."""
-    if self.vram is None:
+  def _atom_executor(self, bios: bytes | None = None):
+    """Shared ATOM executor (neural.py) for post-ASIC_Init command tables."""
+    egpu = pathlib.Path(__file__).resolve().parents[1] / "examples_egpu"
+    if str(egpu) not in sys.path:
+      sys.path.insert(0, str(egpu))
+    import neural as nl  # noqa: PLC0415
+    if bios is None:
+      vbios_path = os.environ.get("AMD_BOOT_VBIOS_FILE", str(DEFAULT_VBIOS))
+      bios = open(vbios_path, "rb").read() if os.path.isfile(vbios_path) else self.dump_vbios_rom()
+    class BootAdapter:
+      def __init__(self, d: "TerrascaleDevice"): self.dev = d; self._wcount = 0
+      def rreg(self, reg: int) -> int: return self.dev.rreg((reg & 0xFFFF) * 4)
+      def wreg(self, reg: int, val: int):
+        self.dev.wreg((reg & 0xFFFF) * 4, val & 0xFFFFFFFF)
+        self._wcount += 1
+        if (self._wcount & 0x3F) == 0 and self.dev.pci.read_config(0, 2) == 0xFFFF:
+          raise RuntimeError("PCI vid=ffff mid-ATOM cmd - power-cycle eGPU")
+      def mmio_sync_safe(self):
+        with contextlib.suppress(Exception):
+          _ = self.dev.rreg(REG_CONFIG_MEMSIZE)
+      def post_atom_sync(self):
+        self.mmio_sync_safe(); time.sleep(0.02)
+    boot = BootAdapter(self)
+    card = nl.AtomCard(boot, debug=False)
+    ctx = nl.parse_atom_context(bios)
+    exe = nl.AtomExecutor(ctx, card)
+    return nl, bios, ctx, exe, boot
+
+  def atom_set_memory_clock(self, mclk_10khz: int = 99300, patch_mpll: bool = True) -> None:
+    """radeon_atom_set_memory_clock - ATOM SetMemoryClock (cmd index 11).
+
+    This VBIOS MemoryPLLInit writes MPLL_AD CLKF=0 (0x85b00000). When
+    patch_mpll=True, intercept those writes and substitute a repaired AD/DQ
+    encoding so ResetMemoryDLL / MemoryTraining run with a live MPLL.
+    """
+    ATOM_CMD_SET_MEMORY_CLOCK = 11
+    # Precompute good AD (same as repair_mpll_boot_clock)
+    good_ad = self._calc_mpll_ad(mclk_10khz)
+    nl, bios, ctx, exe, boot = self._atom_executor()
+    if not nl._u16(bios, ctx.cmd_table + 4 + 2 * ATOM_CMD_SET_MEMORY_CLOCK):
+      raise RuntimeError("SetMemoryClock table missing in VBIOS")
+    os.environ.setdefault("AMD_ATOM_JUMP_BAIL", "1")
+    os.environ.setdefault("AMD_ATOM_QUIET", "1")
+
+    if patch_mpll:
+      # ATOM dword indices: byte_addr/4
+      MPLL_AD_I, MPLL_DQ_I, MCLK_I = 0x189, 0x18B, 0x192  # 0x624, 0x62c, 0x648
+      orig_wreg = boot.wreg
+      patched = {"n": 0}
+
+      def wreg_patch(reg: int, val: int):
+        reg &= 0xFFFF
+        val &= 0xFFFFFFFF
+        if reg in (MPLL_AD_I, MPLL_DQ_I) and (val & 0x7F) == 0:
+          patched["n"] += 1
+          val = good_ad
+        orig_wreg(reg, val)
+
+      boot.wreg = wreg_patch  # type: ignore[method-assign]
+
+    ps = [0] * 16
+    ps[0] = mclk_10khz & 0xFFFFFFFF
+    t0 = time.time()
+    ret = exe.execute_table(ATOM_CMD_SET_MEMORY_CLOCK, ps, 16)
+    self.ensure_mpll_alive(mclk_10khz)
+    ad = self.rreg(0x624)
+    mclk = self.rreg(0x648)
+    extra = f" patched_mpll={patched['n']}" if patch_mpll else ""
+    print(f"terrascale: SetMemoryClock({mclk_10khz}) ret={ret} writes={boot._wcount} "
+          f"MPLL_AD={ad:#x} CLKF={ad & 0x7F} MCLK={mclk:#x} t={time.time()-t0:.1f}s{extra}",
+          flush=True)
+
+  def _calc_mpll_ad(self, mclk_10khz: int = 99300) -> int:
+    """Return MPLL_AD_FUNC_CNTL encoding for GDDR3 boot MCLK (rv770 formula)."""
+    ref = 2700
+    ref_div, post_div = 1, 1
+    fyclk = (mclk_10khz * 4) // 2
+    fb8 = (8 * fyclk * ref_div * post_div) // ref
+    clkf, clkfrac = fb8 // 8, fb8 % 8
+    if clkf > 0x7F:
+      raise RuntimeError(f"MPLL CLKF {clkf} exceeds 7 bits")
+    if clkf <= 0x10: ibias = 0x4B
+    elif clkf <= 0x19: ibias = 0x5B
+    elif clkf <= 0x21: ibias = 0x2B
+    elif clkf <= 0x27: ibias = 0x6C
+    elif clkf <= 0x31: ibias = 0x9D
+    else: ibias = 0xC6
+    enc_ref = [0, 16, 17, 20, 21][ref_div - 1]
+    ypost = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}[post_div]
+    return ((clkf & 0x7F) | ((enc_ref & 0x1F) << 7) | ((clkfrac & 0x1F) << 12) |
+            ((ypost & 3) << 17) | ((ibias & 0x3FF) << 20) | (1 << 31))
+
+  def atom_dynamic_memory_settings(self, mclk_10khz: int = 99300) -> None:
+    """radeon_atom_set_ac_timing - DynamicMemorySettings with COMPUTE_MEMORY_PLL_PARAM."""
+    ATOM_CMD_DYNAMIC_MEMORY_SETTINGS = 63  # atombios.h master list index
+    COMPUTE_MEMORY_PLL_PARAM = 1
+    nl, bios, ctx, exe, boot = self._atom_executor()
+    if not nl._u16(bios, ctx.cmd_table + 4 + 2 * ATOM_CMD_DYNAMIC_MEMORY_SETTINGS):
+      raise RuntimeError("DynamicMemorySettings table missing")
+    os.environ.setdefault("AMD_ATOM_JUMP_BAIL", "1")
+    os.environ.setdefault("AMD_ATOM_QUIET", "1")
+    ps = [0] * 16
+    ps[0] = (mclk_10khz & 0x00FFFFFF) | (COMPUTE_MEMORY_PLL_PARAM << 24)
+    ret = exe.execute_table(ATOM_CMD_DYNAMIC_MEMORY_SETTINGS, ps, 16)
+    print(f"terrascale: DynamicMemorySettings ret={ret} writes={boot._wcount} "
+          f"MISC0={self.rreg(REG_MC_SEQ_MISC0):#x} MCLK={self.rreg(0x648):#x}",
+          flush=True)
+
+  def dump_mc_mem_state(self, tag: str = "") -> dict:
+    """Snapshot MC/MPLL regs relevant to VRAM bring-up (Linux rv770d.h)."""
+    ad = self.rreg(0x624)
+    mclk = self.rreg(0x648)
+    info = {
+      "tag": tag,
+      "memsize": self.rreg(REG_CONFIG_MEMSIZE),
+      "bif": self.rreg(R600_BIF_FB_EN),
+      "fb_loc": self.rreg(REG_MC_VM_FB_LOCATION),
+      "agp_top": self.rreg(REG_MC_VM_AGP_TOP),
+      "agp_bot": self.rreg(REG_MC_VM_AGP_BOT),
+      "citf": self.rreg(R700_MC_CITF_CNTL),
+      "mpll_ad": ad,
+      "clkf": ad & 0x7F,
+      "mclk_pwrmgt": mclk,
+      "dll_ready": bool(mclk & (1 << 6)),
+      "mrdck_sleep": (mclk >> 8) & 0xFF,
+      "mrdck_reset": (mclk >> 16) & 0xFF,
+      "dll_cntl": self.rreg(0x64c),
+      "misc0": self.rreg(REG_MC_SEQ_MISC0),
+      "pci_alive": self.pci.read_config(0, 2) != 0xFFFF,
+    }
+    print(f"terrascale: mc_state{(' '+tag) if tag else ''} "
+          f"MEM={info['memsize']:#x} BIF={info['bif']:#x} FB={info['fb_loc']:#x} "
+          f"CLKF={info['clkf']} DLL_RDY={info['dll_ready']} "
+          f"SLEEP={info['mrdck_sleep']:#x} RST={info['mrdck_reset']:#x} "
+          f"MISC0={info['misc0']:#x} CITF={info['citf']:#x}", flush=True)
+    return info
+
+  def atom_run_cmd(self, index: int, name: str = "", ps0: int = 0) -> int:
+    """Execute one ATOM command table by master-list index."""
+    nl, bios, ctx, exe, boot = self._atom_executor()
+    if not nl._u16(bios, ctx.cmd_table + 4 + 2 * index):
+      raise RuntimeError(f"ATOM cmd {index} ({name or '?'}) missing")
+    os.environ.setdefault("AMD_ATOM_JUMP_BAIL", "1")
+    os.environ.setdefault("AMD_ATOM_QUIET", "1")
+    ps = [0] * 16
+    ps[0] = ps0 & 0xFFFFFFFF
+    t0 = time.time()
+    ret = exe.execute_table(index, ps, 16)
+    if self.pci.read_config(0, 2) == 0xFFFF:
+      raise RuntimeError(f"PCI hung during ATOM {name or index}")
+    print(f"terrascale: ATOM {name or index} ret={ret} writes={boot._wcount} "
+          f"t={time.time() - t0:.1f}s", flush=True)
+    return ret
+
+  def ensure_mpll_alive(self, mclk_10khz: int = 99300) -> None:
+    """After any ATOM memory table: force CLKF!=0 and MRDCK awake."""
+    if (self.rreg(0x624) & 0x7F) == 0:
+      self.repair_mpll_boot_clock(mclk_10khz)
+    self._wake_mrdck()
+    mclk = self.rreg(0x648)
+    if ((mclk >> 8) & 0xFF) or ((mclk >> 16) & 0xFF):
+      # ResetMemoryDLL often leaves SLEEP+RESET; clear again.
+      self._wake_mrdck()
+
+  def finish_memory_after_mpll(self, mclk_10khz: int = 99300) -> None:
+    """Replay SetMemoryClock tail AFTER a good MPLL (skip broken MemoryPLLInit).
+
+    Nested PS values captured from cold ASIC_Init on this VBIOS (HD 4850):
+      SetMemoryClock(ps0 = FIRST_TIME_CHANGE_CLOCK|mclk = 0x08000000|99300)
+      ... MemoryPLLInit (SKIP — writes CLKF=0) ...
+      DynamicMemorySettings / MemoryTraining / ResetMemoryDLL / MemoryDeviceInit
+      with the same flag/clock packing Linux never re-issues after atom_asic_init.
+
+    Also programs MPLL_TIME (rv770_program_mpll_timing_parameters for GDDR3).
+    """
+    self.ensure_mpll_alive(mclk_10khz)
+    # Linux rv770 GDDR3-only MPLL lock/reset timing defaults
+    R600_MPLLLOCKTIME_DFLT, R600_MPLLRESETTIME_DFLT = 100, 150
+    self.wreg(0x654, (R600_MPLLLOCKTIME_DFLT & 0xFFFF) |
+              ((R600_MPLLRESETTIME_DFLT & 0xFFFF) << 16))
+    self.dump_mc_mem_state("pre-finish-mem")
+    FIRST = 0x08000000  # FIRST_TIME_CHANGE_CLOCK
+    mclk = mclk_10khz & 0x00FFFFFF
+    mclk_first = FIRST | mclk
+    # Exact nested order/args from /tmp/atom_nested_ps.json (cold CHG capture)
+    steps: list[tuple[int, str, int, int]] = [
+      # (index, name, ps0, ps1) — skip AdjustMemoryController(0,1) (write-cap loop)
+      (14, "ResetMemoryDLL", 0, 1),
+      (59, "MC_Synchronization", 0, 1),
+      (15, "ResetMemoryDevice", 0, 1),
+      (3, "VRAM_BlockVenderDetection", 0, 1),
+      (18, "AdjustMemoryController", 0x01000000, 1),
+      (59, "MC_Synchronization", 0x01000000, 1),
+      (7, "MemoryParamAdjust", 0x01000000, 1),
+      (63, "DynamicMemorySettings", 0x01000000 | mclk, 1),  # COMPUTE_MEMORY_PLL_PARAM
+      (18, "AdjustMemoryController", 0x01000000 | mclk, 1),
+      (63, "DynamicMemorySettings", 0x02000000 | mclk, mclk_first),
+      (64, "MemoryTraining", 0x02000000 | mclk, mclk_first),
+      (59, "MC_Synchronization", 0x02000000 | mclk, mclk_first),
+      (14, "ResetMemoryDLL", mclk_first, mclk_first),
+      (72, "MemoryDeviceInit", mclk_first, mclk_first),
+    ]
+    for idx, name, ps0, ps1 in steps:
+      try:
+        if ps1:
+          nl, bios, ctx, exe, boot = self._atom_executor()
+          os.environ.setdefault("AMD_ATOM_JUMP_BAIL", "1")
+          os.environ.setdefault("AMD_ATOM_QUIET", "1")
+          ps = [0] * 16
+          ps[0], ps[1] = ps0 & 0xFFFFFFFF, ps1 & 0xFFFFFFFF
+          ret = exe.execute_table(idx, ps, 16)
+          print(f"terrascale: ATOM {name} ret={ret} writes={boot._wcount} "
+                f"ps=[{ps0:#x},{ps1:#x}]", flush=True)
+        else:
+          self.atom_run_cmd(idx, name, ps0)
+      except Exception as e:
+        print(f"terrascale: {name} warning: {e}", flush=True)
+      self.ensure_mpll_alive(mclk_10khz)
+      if self.pci.read_config(0, 2) == 0xFFFF:
+        raise RuntimeError(f"hung after {name}")
+    self.dump_mc_mem_state("post-finish-mem")
+
+  def probe_vram_mm(self, off: int = 0, pat: int = 0xA5A55A5A) -> bool:
+    """Linux radeon_ttm_vram_read path: MM_INDEX|0x80000000 + MM_DATA.
+
+    Accesses MC/VRAM via MMIO without relying on BAR0 mapping. Still needs
+    trained DRAM; safer than BIF+BAR0 when diagnosing (no PCIe FB window).
+    """
+    REG_MM_INDEX, REG_MM_DATA = 0x0, 0x4
+    if self.pci.read_config(0, 2) == 0xFFFF:
+      return False
+    try:
+      self.wreg(REG_MM_INDEX, (off & 0x7FFFFFFF) | 0x80000000)
+      self.wreg(REG_MM_DATA, pat & 0xFFFFFFFF)
+      self.wreg(REG_HDP_DEBUG1, 0)
+      time.sleep(0.02)
+      if self.pci.read_config(0, 2) == 0xFFFF:
+        print("terrascale: MM_INDEX VRAM probe hung MC", flush=True)
+        return False
+      self.wreg(REG_MM_INDEX, (off & 0x7FFFFFFF) | 0x80000000)
+      got = self.rreg(REG_MM_DATA)
+    except Exception as e:
+      print(f"terrascale: MM_INDEX probe exception: {e}", flush=True)
+      return False
+    ok = got == (pat & 0xFFFFFFFF)
+    print(f"terrascale: MM_INDEX VRAM off={off:#x} wrote={pat:#x} got={got:#x} ok={ok}",
+          flush=True)
+    return ok
+
+  def program_mc_vram_linux(self, vram_bytes: int | None = None, enable_bif: bool = True) -> None:
+    """Linux-like rv770_mc_program for PCIe: FB@0, AGP disabled, optional BIF.
+
+    WARNING: BAR0 poke with untrained VRAM can hang MC (pci=ffff). Caller must
+    only enable BIF after MPLL CLKF!=0 and MRDCK awake.
+    """
+    if vram_bytes is None:
+      vram_bytes = int(os.environ.get("AMD_BOOT_VRAM_BYTES", str(1 << 30)), 0)
+    vram_end = vram_bytes - 1
+    # HDP flush quirk
+    _ = self.rreg(REG_HDP_DEBUG1)
+    for i in range(32):
+      base = 0x2C14 + i * 0x18
+      for off in (0, 4, 8, 12, 16):
+        with contextlib.suppress(Exception):
+          self.wreg(base + off, 0)
+    # VGA aperture lockout
+    with contextlib.suppress(Exception):
+      self.wreg(0x328, 1 << 16)  # VGA_HDP_CONTROL VGA_MEMORY_DISABLE
+    self.wreg(REG_CONFIG_MEMSIZE, vram_bytes)
+    self.wreg(REG_MC_VM_SYSTEM_APERTURE_LOW, 0)
+    self.wreg(REG_MC_VM_SYSTEM_APERTURE_HIGH, vram_end >> 12)
+    self.wreg(REG_MC_VM_SYSTEM_APERTURE_DEFAULT, 0)
+    self.wreg(REG_MC_VM_FB_LOCATION, ((vram_end >> 24) << 16) | 0)
+    self.wreg(REG_HDP_NONSURFACE_BASE, 0)
+    self.wreg(REG_HDP_NONSURFACE_INFO, (2 << 7))
+    self.wreg(REG_HDP_NONSURFACE_SIZE, 0x3FFFFFFF)
+    # PCIe discrete: disable AGP aperture (rv770_mc_program else branch)
+    self.wreg(REG_MC_VM_AGP_BASE, 0)
+    self.wreg(REG_MC_VM_AGP_TOP, 0x0FFFFFFF)
+    self.wreg(REG_MC_VM_AGP_BOT, 0x0FFFFFFF)
+    self.agp_size = 0
+    # Clear blackout then allow CPU FB access (rv515_mc_resume)
+    citf = self.rreg(R700_MC_CITF_CNTL)
+    if citf != 0xFFFFFFFF and (citf & R600_BLACKOUT_MASK):
+      self.wreg(R700_MC_CITF_CNTL, citf & ~R600_BLACKOUT_MASK)
+      time.sleep(0.001)
+    if enable_bif:
+      self.ensure_mpll_alive()
+      self.wreg(R600_BIF_FB_EN, R600_FB_READ_EN | R600_FB_WRITE_EN)
+      time.sleep(0.01)
+      if self.pci.read_config(0, 2) == 0xFFFF:
+        raise RuntimeError("MC hung enabling BIF - power-cycle eGPU dock")
+    print(f"terrascale: Linux MC FB=[0,{vram_end:#x}] MEMSIZE={vram_bytes:#x} "
+          f"AGP=disabled BIF={self.rreg(R600_BIF_FB_EN):#x}", flush=True)
+
+  def probe_bar0(self, force: bool = False) -> bool:
+    """Return True if BAR0 write/readback sticks (VRAM usable from host).
+
+    Only safe when BIF_FB_EN is on and FB_LOCATION covers BAR0. Enabling BIF
+    and poking BAR0 with untrained VRAM hangs the MC - gated by AMD_BOOT_PROBE_BAR0
+    unless force=True (explicit --vram-probe).
+    """
+    if not force and not getenv("AMD_BOOT_PROBE_BAR0", 0):
+      return False
+    try:
+      self.map_vram()
+    except Exception as e:
+      print(f"terrascale: BAR0 map failed: {e}", flush=True)
+      return False
+    bif = self.rreg(R600_BIF_FB_EN)
+    if bif == 0:
+      print("terrascale: BAR0 probe skipped (BIF_FB_EN=0)", flush=True)
+      return False
+    if self.pci.read_config(0, 2) == 0xFFFF:
       return False
     pat = 0xA5A55A5A
-    self.vram[0:4] = struct.pack("<I", pat)
-    self.wreg(REG_HDP_DEBUG1, 0)
-    _ = self.vram[0]
-    time.sleep(0.02)
-    got = struct.unpack("<I", bytes(self.vram[0:4]))[0]
+    try:
+      self.vram[0:4] = struct.pack("<I", pat)
+      self.wreg(REG_HDP_DEBUG1, 0)
+      _ = self.vram[0]
+      time.sleep(0.02)
+      if self.pci.read_config(0, 2) == 0xFFFF:
+        print("terrascale: BAR0 probe hung MC (pci=ffff)", flush=True)
+        return False
+      got = struct.unpack("<I", bytes(self.vram[0:4]))[0]
+    except Exception as e:
+      print(f"terrascale: BAR0 probe exception: {e}", flush=True)
+      return False
     ok = got == pat
-    if DEBUG or not ok:
-      print(f"terrascale: BAR0 probe wrote={pat:#x} got={got:#x} ok={ok}", flush=True)
+    print(f"terrascale: BAR0 probe wrote={pat:#x} got={got:#x} ok={ok}", flush=True)
+    return ok
+
+  def vram_probe(self) -> bool:
+    """VRAM stick test after a *good* unpatched ATOM post.
+
+    Do NOT run SetMemoryClock here (wedges MISC0 / can hang on BIF).
+    MM_INDEX with BIF=0 often reads 0 even when FB decode works — use FB@0+BIF.
+    Requires MISC0==0x3000422a (unpatched cold ATOM). Optional finish_memory first.
+    """
+    self.dump_mc_mem_state("pre")
+    # This is an explicit diagnostic, unlike the default AGP-only add path.
+    try:
+      self.map_vram()
+    except Exception as e:
+      print(f"terrascale: BAR0 unavailable for VRAM probe: {e}", flush=True)
+    self.ensure_mpll_alive()
+    misc0 = self.rreg(REG_MC_SEQ_MISC0)
+    if misc0 != 0x3000422A and not getenv("AMD_BOOT_VRAM_FORCE_BIF", 0):
+      print(f"terrascale: refuse BIF/VRAM probe (MISC0={misc0:#x} want 0x3000422a; "
+            f"unpatched --atom first, or AMD_BOOT_VRAM_FORCE_BIF=1)", flush=True)
+      return False
+    if getenv("AMD_BOOT_VRAM_SET_MCLK", 0):
+      print("terrascale: AMD_BOOT_VRAM_SET_MCLK ignored (unsafe on this ROM)", flush=True)
+    if getenv("AMD_BOOT_VRAM_FINISH_MEM", 1):
+      try:
+        self.finish_memory_after_mpll()
+      except Exception as e:
+        print(f"terrascale: finish_memory warning: {e}", flush=True)
+        self.ensure_mpll_alive()
+    self.ensure_mpll_alive()
+    self.dump_mc_mem_state("pre-probe")
+    mm_ok = bif_ok = False
+    # Default ON: FB@0+BIF is the only path that shows real FB bus (float vs sticky).
+    allow_bif = getenv("AMD_BOOT_VRAM_ENABLE_BIF", 1)
+    try:
+      if allow_bif:
+        self.program_mc_vram_linux(enable_bif=False)
+        self.ensure_mpll_alive()
+        if self.rreg(REG_MC_SEQ_MISC0) != 0x3000422A and not getenv("AMD_BOOT_VRAM_FORCE_BIF", 0):
+          print("terrascale: MISC0 lost before BIF - abort", flush=True)
+          return False
+        self.wreg(R600_BIF_FB_EN, R600_FB_READ_EN | R600_FB_WRITE_EN)
+        time.sleep(0.02)
+        if self.pci.read_config(0, 2) == 0xFFFF:
+          raise RuntimeError("MC hung enabling BIF")
+        if self.vram is not None:
+          print(f"terrascale: BAR0 read[0:8]={bytes(self.vram[0:8]).hex()}", flush=True)
+        mm_ok = self.probe_vram_mm(0)
+        bif_ok = self.probe_bar0(force=True)
+      else:
+        self.wreg(R600_BIF_FB_EN, 0)
+        mm_ok = self.probe_vram_mm(0)
+    except Exception as e:
+      print(f"terrascale: BIF/BAR0 path failed: {e}", flush=True)
+      if self.pci.read_config(0, 2) == 0xFFFF:
+        raise
+    finally:
+      if self.pci.read_config(0, 2) != 0xFFFF:
+        with contextlib.suppress(Exception):
+          self.wreg(R600_BIF_FB_EN, 0)
+          self.program_agp()
+    ok = mm_ok or bif_ok
+    print(f"terrascale: vram_probe mm={mm_ok} bar0={bif_ok}", flush=True)
     return ok
 
   def boot(self):
@@ -1319,8 +2152,9 @@ class TerrascaleDevice:
         self.atom_asic_init()
       except Exception as e:
         print(f"terrascale: ATOM warning: {e}", flush=True)
-      self.probe_bar0()
+    # AGP-first: shrink MEMSIZE, park stub FB high, clear BIF (no BAR0 poke).
     self.program_agp()
+    self.probe_bar0()
     if self.chip.family == CHIP_RV770:
       self.load_cp_fw()
       self.cp_resume()
@@ -1328,33 +2162,32 @@ class TerrascaleDevice:
         raise RuntimeError("CP ring test failed")
     else:
       # Evergreen LS path still TODO for real ALU; share CP bring-up later
-      raise RuntimeError("Evergreen LS compute boot not implemented yet — use HD 4850 path")
+      raise RuntimeError("Evergreen LS compute boot not implemented yet - use HD 4850 path")
     self._booted = True
 
-  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0)) -> list[float]:
-    """Vector-add smoke on R700: CP MEM_WRITE of a[i]+b[i] into AGP buffer.
-
-    R700 has no Evergreen LS compute; this validates CP + AGP memory path.
-    Host computes sums; GPU CP writes them (same bring-up pattern as ring_test).
-    """
+  def run_cp_mem_write_test(self, payload=(11.0, 22.0, 33.0, 44.0)) -> list[float]:
+    """Explicit CP-to-AGP payload-write diagnostic; this is not GPU arithmetic."""
     if not self._booted:
       self.boot()
-    expected = [float(x) + float(y) for x, y in zip(a, b)]
+    expected = [float(x) for x in payload]
+    if len(expected) != 4:
+      raise ValueError(f"CP MEM_WRITE test needs exactly four floats, got {len(expected)}")
     out_gpu, out_mem, _ = self.alloc_agp(0x1000)
     out_mem[0:16] = bytes(16)
     sysmem_dma_flush(out_mem, 16)
-    # MEM_WRITE: header + addr_lo + addr_hi|flags + lo + hi (two dwords per write)
-    # Write 4 floats as 2 MEM_WRITE packets (2 dwords each) or 4 single-dword packs.
-    # r600 uses count=3: addr_lo, addr_hi| (1<<18), data0, data1
+    # MEM_WRITE (r600 CS): count=3, qword-aligned addr, addr_hi = upper8 only.
+    # Do NOT set bit18 - that truncates to a 32-bit write (saw [11,0,33,0]).
     words: list[int] = []
     raw = struct.pack("4f", *expected)
     for i in range(0, 16, 8):
       addr = out_gpu + i
+      if addr & 7:
+        raise RuntimeError(f"MEM_WRITE addr {addr:#x} not qword-aligned")
       d0, d1 = struct.unpack_from("<II", raw, i)
       words += [
         packet3(PKT3_MEM_WRITE, 3, compute=False),
         lo32(addr) & 0xFFFFFFFC,
-        (hi32(addr) & 0xFF) | (1 << 18),
+        hi32(addr) & 0xFF,
         d0,
         d1,
       ]
@@ -1369,21 +2202,158 @@ class TerrascaleDevice:
         result = list(expected)
         break
       time.sleep(0.01)
-    print(f"result={result} expected={expected} path=cp_mem_write", flush=True)
+    print(f"cp_mem_write_test result={result} payload={expected} "
+          "(GPU CP wrote a CPU-supplied payload; no GPU ALU)", flush=True)
     if not all(abs(r - e) < 1e-4 for r, e in zip(result, expected)):
-      raise RuntimeError(f"add failed: got {result} expected {expected}")
+      raise RuntimeError(f"CP MEM_WRITE test failed: got {result} payload {expected}")
+    return result
+
+  def init_rv770_graphics_resources(self):
+    """Seed the SQ allocator state that Linux ``rv770_gpu_init`` normally sets.
+
+    Our CP-only boot intentionally omitted the 3D portion of the kernel init,
+    leaving SQ_CONFIG at ``0xe4000000`` and the GPR/thread pools at their tiny
+    reset values.  A pixel shader cannot be scheduled in that state even though
+    CP packets continue to run.  These six config registers use RV770's Linux
+    defaults (256 GPRs, 248 threads, 512 stack entries); they do not touch
+    VRAM, BIF, clocks, or MC routing.
+    """
+    if self.chip.family != CHIP_RV770:
+      raise NotImplementedError("graphics resource init is RV770-specific")
+    regs = (
+      (0x8C00, 0xE4000007),  # SQ_CONFIG: VC/EXPORT_SRC_C/DX9 + stage priorities
+      (0x8C04, 0x00600060),  # SQ_GPR_RESOURCE_MGMT_1: PS=VS=96
+      (0x8C08, 0x001C001C),  # SQ_GPR_RESOURCE_MGMT_2: ES=GS=28
+      (0x8C0C, 0x1F1F3E7C),  # SQ_THREAD_RESOURCE_MGMT: PS/VS/GS/ES
+      (0x8C10, 0x00800080),  # SQ_STACK_RESOURCE_MGMT_1: PS/VS=128
+      (0x8C14, 0x00800080),  # SQ_STACK_RESOURCE_MGMT_2: GS/ES=128
+    )
+    for reg, val in regs:
+      self.wreg(reg, val)
+    self.pci.drain_mmio(self.mmio_bar)
+    observed = tuple(self.rreg(reg) for reg, _ in regs)
+    if observed != tuple(val for _, val in regs):
+      raise RuntimeError(f"RV770 SQ resource init readback mismatch: {observed!r}")
+    print("terrascale: RV770 SQ graphics resources initialized", flush=True)
+
+  def prepare_gpu_add_buffers(self, a=(1.0, 2.0, 3.0, 4.0),
+                              b=(10.0, 20.0, 30.0, 40.0)) -> dict[str, int]:
+    """Allocate the real RV770 graphics-add inputs, programs, and target in AGP.
+
+    This deliberately does *not* emit graphics packets.  It is the last safe
+    preflight before a draw: all data consumed or produced by the GPU is host
+    memory reached via the proven AGP aperture, and `a`/`b` are copied as inputs
+    only.  No CPU sum is calculated or stored.
+    """
+    if not self._booted:
+      self.boot()
+    av, bv = tuple(map(float, a)), tuple(map(float, b))
+    if len(av) != 4 or len(bv) != 4:
+      raise ValueError("GPU add needs exactly four floats in each input vector")
+    ps, vs = compile_rv770_add_blob(), compile_rv770_vs_blob()
+    fetch = build_rv770_vertex_fetch_blob()
+
+    vs_gpu, vs_mem, _ = self.alloc_agp(PAGE_SIZE)
+    ps_gpu, ps_mem, _ = self.alloc_agp(PAGE_SIZE)
+    fetch_gpu, fetch_mem, _ = self.alloc_agp(PAGE_SIZE)
+    vtx_gpu, vtx_mem, _ = self.alloc_agp(PAGE_SIZE)
+    color_gpu, color_mem, _ = self.alloc_agp(PAGE_SIZE)
+    vs_mem[0:len(vs)], ps_mem[0:len(ps)], fetch_mem[0:len(fetch)] = vs, ps, fetch
+    # One oversize triangle covers the 1x1 color target. Every vertex carries
+    # identical operands, making interpolation preserve the requested vectors.
+    positions = ((-1.0, -1.0, 0.0, 1.0), (3.0, -1.0, 0.0, 1.0), (-1.0, 3.0, 0.0, 1.0))
+    vertices = b"".join(struct.pack("12f", *(p + av + bv)) for p in positions)
+    vtx_mem[0:len(vertices)] = vertices
+    color_mem[0:16] = bytes(16)
+    for mem, size in ((vs_mem, len(vs)), (ps_mem, len(ps)), (fetch_mem, len(fetch)),
+                      (vtx_mem, len(vertices)), (color_mem, 16)):
+      sysmem_dma_flush(mem, size)
+    out = {"vs": vs_gpu, "ps": ps_gpu, "fetch": fetch_gpu, "vertices": vtx_gpu, "color": color_gpu,
+           "vs_bytes": len(vs), "ps_bytes": len(ps), "fetch_bytes": len(fetch), "vertex_bytes": len(vertices)}
+    # Retain mappings until completion polling has observed the GPU-written
+    # color target.  They are inputs/outputs only; no CPU result is stored.
+    self._gpu_add_mappings = {"vs": vs_mem, "ps": ps_mem, "fetch": fetch_mem,
+                              "vertices": vtx_mem, "color": color_mem}
+    print("terrascale: GPU-add preflight (no draw) " +
+          " ".join(f"{k}={v:#x}" if k in ("vs", "ps", "fetch", "vertices", "color") else f"{k}={v}"
+                   for k, v in out.items()), flush=True)
+    return out
+
+  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0)) -> list[float]:
+    """Run a real GPU vector add, never a CPU fallback.
+
+    RV770 has the classic graphics CP but not Evergreen's LS compute pipeline.
+    A valid implementation needs an RV770 CF+ALU shader, GFX resource bindings,
+    a draw/dispatch packet sequence, and a GPU-produced AGP result.  Do not
+    substitute PKT3_MEM_WRITE: it merely writes literal packet data.
+    """
+    if self.chip.family != CHIP_RV770:
+      raise NotImplementedError("real add currently targets the attached RV770 / HD 4850")
+    bufs = self.prepare_gpu_add_buffers(a, b)
+    self.init_rv770_graphics_resources()
+    words = build_rv770_add_draw(bufs["vs"], bufs["ps"], bufs["fetch"],
+                                 bufs["vertices"], bufs["color"])
+    # This is the sole execution path: vertex fetch + VS + four PS ALU ADDs +
+    # color export.  In particular, it must never contain PKT3_MEM_WRITE.
+    if any(((w >> 8) & 0xFF) == PKT3_MEM_WRITE for w in words):
+      raise AssertionError("GPU add PM4 unexpectedly contains CP MEM_WRITE")
+    color_mem = self._gpu_add_mappings["color"]
+    self._ring_write_words(words)
+    self._commit_wptr()
+    deadline = time.time() + float(os.environ.get("AMD_BOOT_ADD_WAIT_S", "3"))
+    result = [0.0, 0.0, 0.0, 0.0]
+    while time.time() < deadline:
+      sysmem_dma_flush(color_mem, 16)
+      result = list(struct.unpack("4f", bytes(color_mem[0:16])))
+      if any(x != 0.0 for x in result):
+        break
+      time.sleep(0.01)
+    # CPU arithmetic appears only after completion, as an independent oracle;
+    # the computed values were never uploaded to the output allocation.
+    expected = [float(x) + float(y) for x, y in zip(a, b)]
+    if not all(math.isclose(got, want, rel_tol=1e-5, abs_tol=1e-5)
+               for got, want in zip(result, expected)):
+      rptr = self.rreg(REG_CP_RB_RPTR)
+      wptr = self.rreg(REG_CP_RB_WPTR)
+      grbm = self.rreg(REG_GRBM_STATUS)
+      raise RuntimeError("RV770 GPU add mismatch/timeout: "
+                         f"got {result}, expected {expected}; CP_RPTR={rptr:#x} "
+                         f"CP_WPTR={wptr:#x} GRBM_STATUS={grbm:#x}")
+    print(f"result={result} expected={expected} path=rv770_vs_ps_alu_agp", flush=True)
     return result
 
 def selftest(chip: ChipInfo):
   assert chip.pci_ids
+  # Keep normal boot provably BAR0-free: host AGP is the supported memory path
+  # until a VRAM write/readback survives the explicit --vram-probe.
+  assert "map_bar" not in TerrascaleDevice.__init__.__code__.co_names
+  assert "map_bar" in TerrascaleDevice.map_vram.__code__.co_names
   shader = build_shader_stub_evergreen_add()
   assert len(shader) == 256
   me = build_me_initialize(CHIP_RV770)
   assert me[4] == (1 << 16)
   ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0x40000)
   assert ib[0] >> 30 == PKT_TYPE3
+  rv770_asm = compile_rv770_add_shader() if r600_llc() else ""
+  rv770_blob = compile_rv770_add_blob() if rv770_asm else b""
+  rv770_vs_blob = compile_rv770_vs_blob() if rv770_asm else b""
+  rv770_fetch_blob = build_rv770_vertex_fetch_blob()
+  rv770_draw = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000)
+  assert len(rv770_blob) in (0, 64)
+  assert len(rv770_vs_blob) in (0, 48)
+  assert len(rv770_fetch_blob) == 80
+  # Independent checks of Mesa's R700 layout: clause target (dword 8 / 2),
+  # VFETCH resource 160, and GPR destinations 1/2/3.
+  fetch_dw = struct.unpack("<20I", rv770_fetch_blob)
+  assert fetch_dw[0] == 4 and (fetch_dw[1] & 0x7F800000) == (2 << 23)
+  assert [(fetch_dw[i] >> 8) & 0xFF for i in (8, 12, 16)] == [160, 160, 160]
+  assert [fetch_dw[i] & 0x7F for i in (9, 13, 17)] == [1, 2, 3]
+  assert any(((w >> 8) & 0xFF) == PKT3_DRAW_INDEX_AUTO for w in rv770_draw)
+  assert not any(w & PACKET3_COMPUTE_MODE for w in rv770_draw if w >> 30 == PKT_TYPE3)
   print(f"selftest=ok chip={chip.name} me_words={len(me)} eg_ib={len(ib)} "
-        f"ls_compute={int(chip.has_ls_compute)}")
+        f"ls_compute={int(chip.has_ls_compute)} rv770_alu_add={int(bool(rv770_asm))} "
+        f"rv770_shader_bytes={len(rv770_blob)} rv770_vs_bytes={len(rv770_vs_blob)} "
+        f"rv770_fetch_bytes={len(rv770_fetch_blob)} rv770_draw_dw={len(rv770_draw)}")
 
 def dry_run(chip: ChipInfo):
   print(f"chip={chip.name} family={chip.family} terrascale={chip.terrascale}")
@@ -1392,6 +2362,10 @@ def dry_run(chip: ChipInfo):
     for reg, val in build_cp_resume_regs(0xAB0000, 0x10000, 0xAC0000):
       print(f"  WREG32({reg:#06x}, {val:#010x})")
     print("  ME_INITIALIZE:", " ".join(f"{w:08x}" for w in build_me_initialize(chip.family)))
+    if "--gpu-add-dry-run" in sys.argv:
+      print("  RV770 graphics add PM4:")
+      for i, w in enumerate(build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000)):
+        print(f"  {i:04d}: {w:08x}")
   else:
     ib = PM4Builder().build_dispatch_ib(0xAB0000, 0x1000, 0x2000, 0x3000)
     for i, w in enumerate(ib):
@@ -1444,6 +2418,21 @@ def parse_cases(argv: list[str]) -> list[tuple[tuple[float, ...], tuple[float, .
       b = parse_vec4(arg.split("=", 1)[1])
   return [(a, b)]
 
+def parse_payloads(argv: list[str]) -> list[tuple[float, float, float, float]]:
+  if "--test" in argv:
+    return [
+      (11.0, 22.0, 33.0, 44.0),
+      (5.0, 5.0, 5.0, 5.0),
+      (1.0, -2.0, 3.0, -4.0),
+    ]
+  payload = (11.0, 22.0, 33.0, 44.0)
+  for i, arg in enumerate(argv):
+    if arg == "--payload" and i + 1 < len(argv):
+      payload = parse_vec4(argv[i + 1])
+    elif arg.startswith("--payload="):
+      payload = parse_vec4(arg.split("=", 1)[1])
+  return [payload]
+
 def main():
   argv = sys.argv[1:]
   if any(a in ("--chip=auto", "--auto") for a in argv) or os.environ.get("TS_CHIP", "").lower() == "auto":
@@ -1459,6 +2448,9 @@ def main():
     selftest(chip or CHIPS["hd4850"]); return
   if "--dry-run" in argv:
     dry_run(chip or CHIPS["hd4850"]); return
+  if "--compile-rv770-add" in argv:
+    print(compile_rv770_add_shader(), end="")
+    return
   if "--host-pci" in argv:
     print(diagnose_host())
     for n, v, d in host_pci_scan():
@@ -1480,17 +2472,27 @@ def main():
   if "--atom" in argv:
     dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
     dev.atom_asic_init()
+    ad = dev.rreg(0x624)
     print(f"BAR0_ok={dev.probe_bar0()} BIF={dev.rreg(R600_BIF_FB_EN):#x} "
           f"FB={dev.rreg(REG_MC_VM_FB_LOCATION):#x} "
           f"SPLL={dev.rreg(REG_CG_SPLL_STATUS):#x} "
-          f"MCLK={dev.rreg(0x648):#x}")
+          f"MPLL_AD={ad:#x} CLKF={ad & 0x7F} MCLK={dev.rreg(0x648):#x}")
     return
   if "--clock-probe" in argv:
     dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
+    st = dev.rreg(REG_CG_SPLL_STATUS)
+    ad = dev.rreg(0x624)
+    print(f"pre: SPLL={st:#x} CHG={bool(st & SPLL_CHG_STATUS)} "
+          f"CLKPIN={dev.rreg(0x660):#x} MPLL_AD={ad:#x} CLKF={ad & 0x7F} "
+          f"MCLK={dev.rreg(0x648):#x} MEM={dev.rreg(REG_CONFIG_MEMSIZE):#x}")
     info = dev.prepare_spll_refclk()
     print("clock-probe", info)
-    print(f"MCLK={dev.rreg(0x648):#x} MPLL_AD={dev.rreg(0x624):#x} "
+    ad = dev.rreg(0x624)
+    print(f"MCLK={dev.rreg(0x648):#x} MPLL_AD={ad:#x} CLKF={ad & 0x7F} "
           f"GENERAL={dev.rreg(0x63c):#x} GRBM={dev.rreg(REG_GRBM_STATUS):#x}")
+    if not info.get("chg"):
+      print("HINT: SPLL not locked - physical replug for cold-boot CHG~=0x86, "
+            "then --atom (no synth). Avoid AMD_ATOM_SYNTH_SPLL_CHG.")
     return
   if "--list-chips" in argv:
     for k, c in CHIPS.items():
@@ -1501,8 +2503,39 @@ def main():
     dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
     dev.boot()
     return
+  if "--vram-probe" in argv:
+    # After power-cycle: MPLL repair -> SetMemoryClock tail -> MM_INDEX -> BAR0.
+    # Can still hang if MRDCK left asleep - code wakes before BIF.
+    dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
+    if getenv("AMD_BOOT_ATOM", 1):
+      with contextlib.suppress(Exception):
+        # Prefer existing post-ATOM clocks; full ATOM needs cold CHG.
+        if (dev.rreg(0x624) & 0x7F) == 0:
+          try:
+            dev.atom_asic_init()
+          except Exception as e:
+            print(f"terrascale: ATOM skipped/failed: {e}", flush=True)
+            dev.ensure_mpll_alive()
+    ok = dev.vram_probe()
+    print(f"vram_probe={'PASS' if ok else 'FAIL'}", flush=True)
+    sys.exit(0 if ok else 1)
 
-  # Default: boot + vector-add
+  if "--cp-mem-write-test" in argv:
+    dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
+    print(f"pci={dev.vid:04x}:{dev.did:04x} chip={dev.chip.name}", flush=True)
+    for payload in parse_payloads(argv):
+      dev.run_cp_mem_write_test(payload)
+    return
+  if "--gpu-add-preflight" in argv:
+    dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
+    a, b = parse_cases(argv)[0]
+    dev.prepare_gpu_add_buffers(a, b)
+    return
+
+  if "--test" in argv:
+    raise SystemExit("--test is only valid with --cp-mem-write-test; default add never CPU-offloads")
+
+  # Default: true GPU vector-add only. No CP-MEM_WRITE/CPU fallback is allowed.
   cases = parse_cases(argv)
   try:
     dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
