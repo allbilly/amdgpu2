@@ -115,12 +115,8 @@ class MMIOInterface:
     sz = (self.nbytes - offset) if size is None else size
     return MMIOInterface(self.addr + offset, sz, fmt=fmt or self.fmt)
 
-def sysmem_dma_flush(mem, size: int):
-  """Flush CPU writes so eGPU DMA sees host memory (ARM lacks IO coherency).
-
-  See geerlingguy/raspberry-pi-pcie-devices#756 - Pi5/M1 need explicit sync for
-  GPU DMA to see CPU-written sysmem (yanghaku pgprot_dmacoherent TTM patch).
-  """
+def _sysmem_msync(mem, size: int) -> None:
+  """Best-effort msync over the mapping (CPU cache vs device DMA coherency)."""
   if os.environ.get("AMD_BOOT_SYSMEM_FLUSH", "1") == "0":
     return
   if not hasattr(mem, "addr") or not size:
@@ -130,6 +126,27 @@ def sysmem_dma_flush(mem, size: int):
   if libc.msync(ctypes.c_void_p(mem.addr), size, MS_SYNC) != 0:
     with contextlib.suppress(Exception):
       libc.sync()
+
+def sysmem_sync_for_device(mem, size: int) -> None:
+  """Publish CPU-written sysmem so the eGPU DMA engine sees it.
+
+  Used for shader binaries, vertex data, ring contents, cleared fence and
+  initialized canary color pages before a submit.
+  """
+  _sysmem_msync(mem, size)
+
+def sysmem_sync_for_cpu(mem, size: int) -> None:
+  """Make device-written sysmem visible to the CPU before a readback.
+
+  The CP MEM_WRITE test already proved GPU writes can reach the mapping, so on
+  most hosts this is a no-op; we still centralize it so the graphics result is
+  never read through stale CPU caches.
+  """
+  _sysmem_msync(mem, size)
+
+def sysmem_dma_flush(mem, size: int):
+  """Deprecated: use sysmem_sync_for_device / sysmem_sync_for_cpu."""
+  sysmem_sync_for_device(mem, size)
 
 class FileIOInterface:
   def __init__(self, fd=None):
@@ -525,8 +542,26 @@ def S_0288D4_STACK_SIZE(x: int) -> int:
 # RV770 graphics registers / encodings, copied from Mesa r600d.h.  Values are
 # byte MMIO addresses; PM4 converts them to packet-relative dword offsets.
 REG_VGT_PRIMITIVE_TYPE = 0x8958
+REG_VGT_NUM_INSTANCES = 0x8974
+REG_VGT_OUTPUT_PATH_CNTL, REG_VGT_HOS_CNTL = 0x28A10, 0x28A14
+REG_VGT_HOS_MAX_TESS_LEVEL, REG_VGT_HOS_MIN_TESS_LEVEL = 0x28A18, 0x28A1C
+REG_VGT_HOS_REUSE_DEPTH, REG_VGT_GROUP_PRIM_TYPE = 0x28A20, 0x28A24
+REG_VGT_GS_MODE, REG_VGT_PRIMITIVEID_EN = 0x28A40, 0x28A84
+REG_VGT_INSTANCE_STEP_RATE_0, REG_VGT_INSTANCE_STEP_RATE_1 = 0x28AA0, 0x28AA4
+REG_VGT_REUSE_OFF, REG_VGT_VTX_CNT_EN = 0x28AB4, 0x28AB8
+REG_VGT_STRMOUT_BUFFER_EN = 0x28B20
+REG_VGT_STRMOUT_EN = 0x28AB0
+REG_VGT_STRMOUT_BUFFER_SIZE_0, REG_VGT_STRMOUT_VTX_STRIDE_0 = 0x28AD0, 0x28AD4
+REG_VGT_STRMOUT_BUFFER_BASE_0, REG_VGT_STRMOUT_BUFFER_OFFSET_0 = 0x28AD8, 0x28ADC
+REG_VGT_MAX_VTX_INDX, REG_VGT_MIN_VTX_INDX = 0x28400, 0x28404
+REG_SQ_PGM_CF_OFFSET_PS, REG_SQ_PGM_CF_OFFSET_VS = 0x288CC, 0x288D0
+REG_SQ_PGM_CF_OFFSET_GS, REG_SQ_PGM_CF_OFFSET_ES = 0x288D4, 0x288D8
+REG_SQ_PGM_CF_OFFSET_FS = 0x288DC
+REG_SQ_VTX_SEMANTIC_CLEAR = 0x288E0
+REG_SQ_PGM_RESOURCES_FS = 0x288A4
 REG_CB_COLOR0_BASE, REG_CB_COLOR0_SIZE = 0x28040, 0x28060
 REG_CB_COLOR0_VIEW, REG_CB_COLOR0_INFO, REG_CB_COLOR0_MASK = 0x28080, 0x280A0, 0x28100
+REG_CB_COLOR0_FRAG, REG_CB_COLOR0_TILE = 0x280E0, 0x280C0
 REG_CB_TARGET_MASK, REG_CB_SHADER_MASK = 0x28238, 0x2823C
 REG_SQ_PGM_START_PS, REG_SQ_PGM_RESOURCES_PS, REG_SQ_PGM_EXPORTS_PS = 0x28840, 0x28850, 0x28854
 REG_SQ_PGM_START_VS, REG_SQ_PGM_RESOURCES_VS, REG_SQ_PGM_START_FS = 0x28858, 0x28868, 0x28894
@@ -545,6 +580,65 @@ RV770_FETCH_RESOURCE_VS = 160
 RV770_VTX_FORMAT_32_32_32_32_FLOAT = 0x23
 RV770_COLOR_32_32_32_32_FLOAT = 0x23
 RV770_DI_PT_TRILIST, RV770_DI_SRC_SEL_AUTO_INDEX = 4, 2
+
+# --- R600 PM4 completion / cache-coherency packets (r600d.h) ---
+PKT3_SURFACE_SYNC = 0x43
+PKT3_EVENT_WRITE_EOP = 0x47
+EVENT_TYPE_CACHE_FLUSH_AND_INV_TS = 0x14      # CACHE_FLUSH_AND_INV_EVENT_TS
+EVENT_TYPE_CACHE_FLUSH_AND_INV = 0x16         # CACHE_FLUSH_AND_INV_EVENT
+EVENT_INDEX_TS = 5
+EVENT_INDEX_NON_TS = 0
+DATA_SEL_32 = 1                               # EOP writes low 32 bits
+DATA_SEL_64 = 2
+INT_SEL_NONE = 0                             # poll memory, no IRQ (TinyGPU masks MSI)
+PACKET3_TC_ACTION_ENA = 1 << 23
+PACKET3_VC_ACTION_ENA = 1 << 24
+PACKET3_CB_ACTION_ENA = 1 << 25
+PACKET3_DB_ACTION_ENA = 1 << 26
+PACKET3_SH_ACTION_ENA = 1 << 27
+PACKET3_SMX_ACTION_ENA = 1 << 28
+PACKET3_CB0_DEST_BASE_ENA = 1 << 6
+PACKET3_FULL_CACHE_ENA = 1 << 20             # r7xx+ only
+REG_WAIT_UNTIL = 0x8040
+WAIT_3D_IDLE = 1 << 0
+WAIT_3D_IDLECLEAN = 1 << 4
+
+# --- R600/R700 graphics context registers (byte MMIO offsets) ---
+REG_PA_CL_CLIP_CNTL = 0x28810
+REG_PA_SC_CLIPRECT_RULE = 0x2820C
+REG_PA_SC_EDGERULE = 0x28230
+REG_PA_SC_AA_CONFIG = 0x28C04
+REG_PA_SC_WINDOW_OFFSET = 0x28200
+REG_SPI_INTERP_CONTROL_0 = 0x286D4
+REG_DB_DEPTH_CONTROL = 0x28800
+REG_DB_SHADER_CONTROL = 0x2880C
+REG_DB_RENDER_CONTROL = 0x28D0C
+REG_DB_RENDER_OVERRIDE = 0x28D10
+REG_SX_ALPHA_TEST_CONTROL = 0x28814
+REG_PA_CL_VPORT_ZSCALE_0 = 0x28444
+REG_PA_CL_VPORT_ZOFFSET_0 = 0x28448
+REG_CB_COLOR0_ATTRIB2 = 0x28104
+
+def rv770_cb_color_control(*, rop3: int = 0xCC, special_op: int = 0,
+                           target_blend_enable: int = 0) -> int:
+  """Encode CB_COLOR_CONTROL for a direct (no-blend) color write.
+
+  bit 4-6  SPECIAL_OP  (0 = normal, 1 = disable)
+  bit 8-15 TARGET_BLEND_ENABLE
+  bit 16-23 ROP3       (0xCC = raster source copy)
+  """
+  return (((special_op & 0x7) << 4) | ((target_blend_enable & 0xFF) << 8) |
+          ((rop3 & 0xFF) << 16))
+
+def rv770_color_info_rgba32_float() -> int:
+  """Encode CB_COLOR0_INFO for linear RGBA32_FLOAT, no CMASK/FMASK."""
+  # FORMAT=0x23 (COLOR_32_32_32_32_FLOAT) at bit 2, ARRAY_LINEAR_ALIGNED=1
+  # at bit 8, NUMBER_FLOAT=7 at bit 12, SWAP_STD=0, SIMPLE_FLOAT=1.
+  # Mesa uses the aligned-linear mode even for a one-pixel surface; ARRAY_MODE
+  # zero is linear-general and leaves the CB geometry undefined on R700.
+  return ((0x23 << 2) | (1 << 8) | (7 << 12) | (0 << 16) | (1 << 24))
+
+COLOR_CANARY = 0xA5  # fill value for the color target before a draw
 
 # =============================================================================
 # Placeholder CF/ALU binary (Evergreen LS) - replaced when HW + llvm-mc land
@@ -572,6 +666,18 @@ OP_NAME = "add"
 
 RV770_ADD_LL = pathlib.Path(__file__).with_name("rv770_add.ll")
 RV770_VS_LL = pathlib.Path(__file__).with_name("rv770_vs.ll")
+RV770_CONSTANT_PS_LL = pathlib.Path(__file__).with_name("rv770_constant_ps.ll")
+RV770_PARAM0_PS_LL = pathlib.Path(__file__).with_name("rv770_param0_ps.ll")
+RV770_CONSTANT_VS_LL = pathlib.Path(__file__).with_name("rv770_constant_vs.ll")
+RV770_STREAM_ADD_VS_LL = pathlib.Path(__file__).with_name("rv770_stream_add_vs.ll")
+
+GPU_ADD_STAGE_CP = "cp"
+GPU_ADD_STAGE_CONSTANT = "constant"
+GPU_ADD_STAGE_PARAM0 = "param0"
+GPU_ADD_STAGE_ADD = "add"
+GPU_ADD_STAGE_STREAM = "stream"
+GPU_ADD_STAGES = (GPU_ADD_STAGE_CP, GPU_ADD_STAGE_CONSTANT,
+                  GPU_ADD_STAGE_PARAM0, GPU_ADD_STAGE_ADD, GPU_ADD_STAGE_STREAM)
 
 def r600_llc() -> str | None:
   """Return an LLVM compiler with the legacy R600 backend, if installed."""
@@ -671,6 +777,64 @@ def compile_rv770_vs_blob() -> bytes:
       raise RuntimeError("unexpected LLVM RV770 VS export layout")
     words[word_index] = (word & ~(0x7F << 15)) | ((source_gpr + 1) << 15)
   return struct.pack("<12I", *words)
+
+def compile_rv770_ps_blob(src: pathlib.Path, expected_size: int | None = None) -> bytes:
+  """Compile any RV770 pixel shader source to its executable `.text` blob."""
+  llc = r600_llc()
+  if llc is None or not src.is_file():
+    raise RuntimeError(f"missing R600 compiler or pixel shader source {src}")
+  proc = subprocess.run([llc, "-march=r600", "-mcpu=rv770", "-filetype=obj", str(src), "-o", "-"],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+  if proc.returncode:
+    raise RuntimeError(f"RV770 PS compile {src} failed:\n{proc.stderr.decode().strip()}")
+  return elf_text(proc.stdout, expected_size=expected_size)
+
+def compile_rv770_constant_ps_blob() -> bytes:
+  return compile_rv770_ps_blob(RV770_CONSTANT_PS_LL)
+
+def compile_rv770_param0_ps_blob() -> bytes:
+  return compile_rv770_ps_blob(RV770_PARAM0_PS_LL)
+
+def compile_rv770_constant_vs_blob() -> bytes:
+  """Compile the no-fetch diagnostic VS used by the constant stage."""
+  return compile_rv770_ps_blob(RV770_CONSTANT_VS_LL)
+
+def compile_rv770_stream_add_vs_blob() -> bytes:
+  """Compile streamout VS and relocate its inputs to fetch GPR2/GPR3.
+
+  LLVM's standalone VS ABI uses position/a/b in GPR0/1/2; Mesa's R700 fetch
+  shader reserves GPR0 for vertex ID and writes them to GPR1/2/3.  The stream
+  shader has only exports and four ADD ALUs, so these source/destination field
+  relocations are checked and deterministic.
+  """
+  raw = compile_rv770_ps_blob(RV770_STREAM_ADD_VS_LL, expected_size=80)
+  words = list(struct.unpack("<20I", raw))
+  # POS export (CF word 0), stream export (buffer export word 0).
+  for idx, old in ((4, 0), (6, 1)):
+    if ((words[idx] >> 15) & 0x7F) != old:
+      raise RuntimeError("unexpected stream VS export GPR layout")
+    words[idx] = (words[idx] & ~(0x7F << 15)) | ((old + 1) << 15)
+  # Four R700 ALU ADD pairs in the final clause: src1/src2 and destination
+  # GPRs move from (1,2,1) to (2,3,2).
+  for i in (12, 14, 16, 18):
+    w0, w1 = words[i], words[i + 1]
+    if ((w0 & 0x1FF, (w0 >> 13) & 0x1FF, (w1 >> 21) & 0x7F) != (1, 2, 1)):
+      raise RuntimeError("unexpected stream VS ADD operand layout")
+    words[i] = (w0 & ~((0x1FF << 0) | (0x1FF << 13))) | (2 << 0) | (3 << 13)
+    words[i + 1] = (w1 & ~(0x7F << 21)) | (2 << 21)
+  return struct.pack("<20I", *words)
+
+def build_rv770_noop_fetch_blob() -> bytes:
+  """R700 fetch program that only returns (for the constant-position test)."""
+  return struct.pack("<2I", 0, (21 << 23) | (1 << 21) | (1 << 31))
+
+def build_rv770_empty_ps_blob() -> bytes:
+  """Minimal CF_END PS for isolating raster/CB state from shader execution."""
+  return struct.pack("<4I", 0, (0x20 << 23) | (1 << 21) | (1 << 31), 0, 0)
+
+def build_rv770_empty_vs_blob() -> bytes:
+  """Minimal CF_END VS for isolating draw/CB state from shader execution."""
+  return build_rv770_empty_ps_blob()
 
 def build_rv770_vertex_fetch_blob() -> bytes:
   """Build Mesa's RV770 vertex-fetch program for ``position, a, b``.
@@ -793,45 +957,172 @@ class PM4Builder:
     self.pkt3(PKT3_NOP, lo32(b_va), hi32(b_va), compute=True)
     return self.words
 
-def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
-                         vertices_gpu: int, color_gpu: int) -> list[int]:
-  """Build the non-compute PM4 for one RV770 fullscreen-triangle add draw.
+def emit_rv770_completion(p: "PM4Builder", fence_gpu: int, fence_sequence: int,
+                          mode: str = "eop") -> None:
+  """Append a cache-flushing graphics completion to ``p``.
 
-  This is intentionally a pure builder so every dword can be reviewed with
-  ``--gpu-add-dry-run`` before hardware submission.  It contains no literal
-  result payload: the only result path is PS export -> CB_COLOR0 in AGP memory.
+  ``eop`` (preferred): SURFACE_SYNC then EVENT_WRITE_EOP that writes the 32-bit
+  ``fence_sequence`` into ``fence_gpu``.  No interrupt is selected because
+  TinyGPU masks MSIs; the CPU polls the fence memory instead.
+
+  ``wait-memwrite`` (debug only): SURFACE_SYNC, EVENT_WRITE cache flush,
+  WAIT_UNTIL 3D idle, then a single CP MEM_WRITE of the sequence to
+  ``fence_gpu``.  This may use MEM_WRITE *only* for the fence, never the color
+  target.
+  """
+  coher = (PACKET3_TC_ACTION_ENA | PACKET3_VC_ACTION_ENA |
+           PACKET3_CB_ACTION_ENA | PACKET3_CB0_DEST_BASE_ENA |
+           PACKET3_SH_ACTION_ENA | PACKET3_SMX_ACTION_ENA |
+           PACKET3_FULL_CACHE_ENA)
+  if mode == "raw-memwrite":
+    # Diagnostic only: CP writes a fence immediately after DRAW, with no
+    # cache/3D-idle wait.  This distinguishes a stalled graphics engine from
+    # a bad completion packet.
+    d0, d1 = data64_le(fence_sequence & 0xFFFFFFFF)
+    p.pkt3(PKT3_MEM_WRITE,
+           lo32(fence_gpu) & 0xFFFFFFFC, hi32(fence_gpu) & 0xFF, d0, d1, compute=False)
+    return
+  # SURFACE_SYNC: coher_cntl, 0xFFFFFFFF, 0, poll_interval=10
+  p.pkt3(PKT3_SURFACE_SYNC, coher, 0xFFFFFFFF, 0, 10, compute=False)
+  if mode == "eop":
+    p.pkt3(PKT3_EVENT_WRITE_EOP,
+           EVENT_TYPE_CACHE_FLUSH_AND_INV_TS | (EVENT_INDEX_TS << 8),
+           lo32(fence_gpu),
+           (hi32(fence_gpu) & 0xFF) | (DATA_SEL_32 << 29) | (INT_SEL_NONE << 24),
+           fence_sequence & 0xFFFFFFFF, 0, compute=False)
+  else:
+    p.pkt3(PKT3_EVENT_WRITE,
+           EVENT_TYPE_CACHE_FLUSH_AND_INV | (EVENT_INDEX_NON_TS << 8), compute=False)
+    off = (REG_WAIT_UNTIL - PACKET3_SET_CONFIG_REG_START) >> 2
+    p.pkt3(PKT3_SET_CONFIG_REG, off, WAIT_3D_IDLE | WAIT_3D_IDLECLEAN, compute=False)
+    d0, d1 = data64_le(fence_sequence & 0xFFFFFFFF)
+    p.pkt3(PKT3_MEM_WRITE,
+           lo32(fence_gpu) & 0xFFFFFFFC, hi32(fence_gpu) & 0xFF, d0, d1, compute=False)
+
+def emit_rv770_full_gfx_init(p: "PM4Builder") -> None:
+  """Opt-in explicit R700 graphics-context defaults (Phase 7).
+
+  Disables clipping, AA, depth and alpha test so a draw cannot be silently
+  dropped by reset-default state.  Safe: every entry is a disable/zero that
+  does not touch MC routing, display, clocks or local VRAM ownership.
+  """
+  # r600_init_atom_start_cs VGT defaults: these are required even for a
+  # triangle-list with no tessellation/GS/streamout.
+  p.set_context_reg_seq(REG_VGT_OUTPUT_PATH_CNTL, 0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0)
+  p.set_context_reg(REG_VGT_GS_MODE, 0)
+  p.set_context_reg(REG_VGT_PRIMITIVEID_EN, 0)
+  p.set_context_reg_seq(REG_VGT_INSTANCE_STEP_RATE_0, 0, 0)
+  p.set_context_reg_seq(REG_VGT_REUSE_OFF, 1, 0)
+  p.set_context_reg(REG_VGT_STRMOUT_BUFFER_EN, 0)
+  p.set_context_reg_seq(REG_VGT_MAX_VTX_INDX, 0xFFFFFFFF, 0)
+  p.set_context_reg_seq(REG_SQ_PGM_CF_OFFSET_PS, 0, 0, 0, 0, 0)
+  p.set_context_reg(REG_SQ_VTX_SEMANTIC_CLEAR, 0xFFFFFFFF)
+  p.set_context_reg(REG_SQ_PGM_RESOURCES_FS, 0)
+  p.set_context_reg(REG_PA_CL_CLIP_CNTL, 0)            # no user clip planes
+  p.set_context_reg(REG_PA_SC_CLIPRECT_RULE, 0x0000FFFF)  # all cliprect edges pass
+  p.set_context_reg(REG_PA_SC_EDGERULE, 0xFFFF)
+  p.set_context_reg(REG_PA_SC_AA_CONFIG, 0)            # no MSAA
+  p.set_context_reg(REG_PA_SC_WINDOW_OFFSET, 0)
+  p.set_context_reg(REG_SPI_INTERP_CONTROL_0, 0)
+  p.set_context_reg(REG_DB_DEPTH_CONTROL, 0)           # depth test/compare off
+  p.set_context_reg(REG_DB_SHADER_CONTROL, 0)
+  p.set_context_reg(REG_DB_RENDER_CONTROL, 0)
+  p.set_context_reg(REG_DB_RENDER_OVERRIDE, 0)
+  p.set_context_reg(REG_SX_ALPHA_TEST_CONTROL, 0)      # alpha test bypass
+
+def _rv770_stage_linkage(stage: str) -> tuple[int, tuple[int, ...]]:
+  """Return (NUM_INTERP, SPI_PS_INPUT_CNTL_0 entries) for ``stage``."""
+  if stage in (GPU_ADD_STAGE_CONSTANT, GPU_ADD_STAGE_STREAM):
+    return 0, ()
+  if stage == GPU_ADD_STAGE_PARAM0:
+    return 1, (0 | (1 << 12),)            # semantic 0
+  # add (and any other graphics stage): two interpolated inputs, semantics 0/1
+  return 2, (0 | (1 << 12), 1 | (1 << 12))
+
+def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
+                         vertices_gpu: int, color_gpu: int, *,
+                         stage: str = "add", fence_gpu: int = 0,
+                         fence_sequence: int = 0, fence_mode: str = "eop",
+                         full_gfx_init: bool = False,
+                         constant_vs: bool = False,
+                         empty_vs: bool = False) -> list[int]:
+  """Build the non-compute PM4 for one RV770 fullscreen-triangle draw.
+
+  Pure builder: every dword can be reviewed with ``--gpu-add-dry-run`` before
+  hardware submission.  It never contains a literal result payload; the only
+  result path is PS export -> CB_COLOR0 in AGP memory.
+
+  Stages:
+    ``cp``       - completion fence only (no draw); proves fence + CPU visibility.
+    ``constant`` - PS exports a constant; proves draw/raster/PS/CB.
+    ``param0``   - PS exports interpolated PARAM0; proves fetch/VS/SPI linkage.
+    ``add``      - PS exports PARAM0 + PARAM1; the real GPU arithmetic.
   """
   for name, addr in (("VS", vs_gpu), ("PS", ps_gpu), ("fetch", fetch_gpu),
                      ("vertices", vertices_gpu), ("color", color_gpu)):
     if addr & 0xFF:
       raise ValueError(f"RV770 {name} address must be 256-byte aligned: {addr:#x}")
+  if fence_gpu & 7:
+    raise ValueError(f"RV770 fence address must be 8-byte aligned: {fence_gpu:#x}")
   p = PM4Builder(compute=False)
-  # Mesa r600_init_atom_start_cs: establish a clean graphics context.
   p.pkt3(PKT3_CONTEXT_CONTROL, 0x80000000, 0x80000000, compute=False)
+  if stage == GPU_ADD_STAGE_CP:
+    emit_rv770_completion(p, fence_gpu, fence_sequence, fence_mode)
+    return p.words
+  # Mesa r600_init_atom_start_cs: establish a clean graphics context.
   p.set_config_reg(REG_VGT_PRIMITIVE_TYPE, RV770_DI_PT_TRILIST)
+  p.set_config_reg(REG_VGT_NUM_INSTANCES, 1)
   # r600_emit_vertex_buffers: resource bank VS=160; buffer is three 48-byte
   # records.  The direct transport has no kernel relocation, hence the GPU
   # aperture address is supplied in WORD0 rather than Mesa's reloc placeholder.
-  p.set_resource(RV770_FETCH_RESOURCE_VS,
-                 vertices_gpu, PAGE_SIZE - 1, 48 << 8, 0, 0, 0, 0xC0000000)
+  if not constant_vs and not empty_vs:
+    p.set_resource(RV770_FETCH_RESOURCE_VS,
+                   vertices_gpu, PAGE_SIZE - 1, 48 << 8, 0, 0, 0, 0xC0000000)
   # Programs and their compiler-reported GPR requirements.  LLVM's VS inputs
-  # are fetch GPR 1/2/3; PS consumes the two interpolated parameter exports.
+  # are fetch GPR 1/2/3; PS consumes the interpolated parameter exports.
   p.set_context_reg(REG_SQ_PGM_START_FS, fetch_gpu >> 8)
   p.set_context_reg(REG_SQ_PGM_START_VS, vs_gpu >> 8)
   # LLVM's .AMDGPU.config reports VS resources=0x103 (three GPRs, one stack
   # entry) and PS resources=0x2 (two GPRs, no stack); do not guess clamps.
-  p.set_context_reg(REG_SQ_PGM_RESOURCES_VS, 4 | (1 << 8))
+  p.set_context_reg(REG_SQ_PGM_RESOURCES_VS, (0 if empty_vs else (1 if constant_vs else 4)) | (1 << 8))
   p.set_context_reg(REG_SQ_PGM_START_PS, ps_gpu >> 8)
-  p.set_context_reg_seq(REG_SQ_PGM_RESOURCES_PS, 2, 2)  # one color export
-  # Position plus two parameter exports, all four-component.  PARAM[0]/[1]
-  # have semantics 0/1 and feed the two PS arguments T0/T1.
-  p.set_context_reg(REG_SPI_VS_OUT_ID_0, 0 | (1 << 8))
-  p.set_context_reg(REG_SPI_VS_OUT_CONFIG, 1 << 1)
-  p.set_context_reg_seq(REG_SPI_PS_INPUT_CNTL_0, 0 | (1 << 12), 1 | (1 << 12))
-  p.set_context_reg_seq(REG_SPI_PS_IN_CONTROL_0, 2 | (1 << 29), 0)
+  streamout = stage == GPU_ADD_STAGE_STREAM
+  ps_gprs = 0 if (getenv("AMD_GPU_ADD_EMPTY_PS", 0) or streamout) else (1 if stage == GPU_ADD_STAGE_CONSTANT else 2)
+  ps_exports = 0 if (getenv("AMD_GPU_ADD_EMPTY_PS", 0) or streamout) else 2
+  p.set_context_reg_seq(REG_SQ_PGM_RESOURCES_PS, ps_gprs, ps_exports)
+  # VS always exports POS + PARAM0(sem0) + PARAM1(sem1); only the PS side
+  # changes per stage (num_interp and which inputs are consumed).
+  if empty_vs:
+    # A CF_END-only VS exports no position/parameters; do not advertise the
+    # normal three-export linkage while running this isolation probe.
+    p.set_context_reg(REG_SPI_VS_OUT_ID_0, 0)
+    p.set_context_reg(REG_SPI_VS_OUT_CONFIG, 0)
+  else:
+    p.set_context_reg(REG_SPI_VS_OUT_ID_0, 0 | (1 << 8))
+    p.set_context_reg(REG_SPI_VS_OUT_CONFIG, 1 << 1)
+  num_interp, ps_inputs = _rv770_stage_linkage(stage)
+  if ps_inputs:
+    p.set_context_reg_seq(REG_SPI_PS_INPUT_CNTL_0, *ps_inputs)
+  # Mesa enables both gradient engines in normal PS state even when NUM_INTERP
+  # is zero (constant stage); leaving PERSP_GRADIENT_ENA reset can strand SH.
+  p.set_context_reg_seq(REG_SPI_PS_IN_CONTROL_0, num_interp | (1 << 28) | (1 << 29), 0)
   # Convert the fullscreen triangle's NDC position to a single-pixel viewport.
   p.set_context_reg(REG_PA_CL_VTE_CNTL, (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 10))
+  # These are required even without the optional Mesa-style full context
+  # replay.  After our CP/graphics reset, stale clip/depth state can discard
+  # every primitive before it reaches the pixel backend.
+  p.set_context_reg(REG_PA_CL_CLIP_CNTL, 0)
+  p.set_context_reg(REG_PA_SC_CLIPRECT_RULE, 0x0000FFFF)
+  p.set_context_reg(REG_PA_SC_EDGERULE, 0xFFFF)
+  p.set_context_reg(REG_PA_SC_AA_CONFIG, 0)
+  p.set_context_reg(REG_PA_SC_WINDOW_OFFSET, 0)
+  p.set_context_reg(REG_DB_DEPTH_CONTROL, 0)
+  p.set_context_reg(REG_DB_SHADER_CONTROL, 0)
+  p.set_context_reg(REG_DB_RENDER_CONTROL, 0)
+  p.set_context_reg(REG_DB_RENDER_OVERRIDE, 0)
   half = struct.unpack("<I", struct.pack("<f", 0.5))[0]
+  # XSCALE, XOFFSET, YSCALE, YOFFSET, ZSCALE, ZOFFSET (one-pixel viewport).
   p.set_context_reg_seq(REG_PA_CL_VPORT_XSCALE_0, half, half, half, half, half, half)
   p.set_context_reg_seq(REG_PA_SC_WINDOW_SCISSOR_TL, 0, 1 | (1 << 16))
   p.set_context_reg_seq(REG_PA_SC_GENERIC_SCISSOR_TL, 0, 1 | (1 << 16))
@@ -841,9 +1132,16 @@ def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
   p.set_context_reg(REG_PA_SU_SC_MODE_CNTL, 0)  # fill, no culling
   p.set_context_reg(REG_PA_SU_VTX_CNTL, 1 | (2 << 1) | (5 << 3))
   p.set_context_reg(REG_PA_SC_MODE_CNTL, (1 << 14) | (1 << 16) | (1 << 20) | (1 << 22))
+  if full_gfx_init:
+    emit_rv770_full_gfx_init(p)
   # Linear RGBA32_FLOAT, no CMASK/FMASK.  COLOR0_BASE is in 256-byte units.
-  color_info = (RV770_COLOR_32_32_32_32_FLOAT << 2) | (7 << 12) | (1 << 24)
+  color_info = rv770_color_info_rgba32_float()
   p.set_context_reg(REG_CB_COLOR0_BASE, color_gpu >> 8)
+  # Mesa binds the non-MSAA surface's fmask/cmask backing addresses even when
+  # both alias the color base.  Leaving these at reset zero can suppress all
+  # CB writes on R700.
+  p.set_context_reg(REG_CB_COLOR0_FRAG, color_gpu >> 8)
+  p.set_context_reg(REG_CB_COLOR0_TILE, color_gpu >> 8)
   p.set_context_reg(REG_CB_COLOR0_SIZE, 0)
   p.set_context_reg(REG_CB_COLOR0_VIEW, 0)
   p.set_context_reg(REG_CB_COLOR0_INFO, color_info)
@@ -851,9 +1149,102 @@ def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
   p.set_context_reg_seq(REG_CB_TARGET_MASK, 0xF, 0xF)
   p.set_context_reg(REG_CB_BLEND0_CONTROL, 0)
   p.set_context_reg(REG_CB_BLEND_CONTROL, 0)
-  p.set_context_reg(REG_CB_COLOR_CONTROL, 0)
+  # CB_NORMAL (special_op=0) with ROP3=copy: the color backend is enabled and
+  # writes the shader output.  CB_COLOR_CONTROL=0 disables the CB entirely.
+  p.set_context_reg(REG_CB_COLOR_CONTROL,
+                    rv770_cb_color_control(rop3=0xCC, special_op=0))
+  if streamout:
+    # r600_streamout.c: size is the end offset in dwords, stride is dwords per
+    # vertex, and base is in 256-byte units.  The VS stream export writes sum
+    # to the same AGP page used as the result allocation.
+    p.set_context_reg_seq(REG_VGT_STRMOUT_BUFFER_SIZE_0,
+                          PAGE_SIZE >> 2, 4, color_gpu >> 8)
+    p.set_context_reg(REG_VGT_STRMOUT_BUFFER_OFFSET_0, 0)
+    p.set_context_reg(REG_VGT_STRMOUT_BUFFER_EN, 1)
+    p.set_context_reg(REG_VGT_STRMOUT_EN, 1)
   p.pkt3(PKT3_DRAW_INDEX_AUTO, 3, RV770_DI_SRC_SEL_AUTO_INDEX, compute=False)
+  emit_rv770_completion(p, fence_gpu, fence_sequence, fence_mode)
   return p.words
+
+def validate_gpu_add_pm4(words: list[int], *, color_gpu: int, fence_gpu: int,
+                         stage: str = "add", allow_fence_memwrite: bool = False) -> None:
+  """Reject CP result writes and malformed completion packets.
+
+  The only permitted result path is PS export -> CB_COLOR0.  Any CP MEM_WRITE
+  to the color target is forbidden.  Exactly one completion fence must be
+  emitted, and (for graphics stages) it must follow the draw/wait.
+  """
+  saw_draw = False
+  fence_writes = 0
+  fence_after_draw = True
+  for i, w in enumerate(words):
+    if w >> 30 != PKT_TYPE3:
+      continue
+    op = (w >> 8) & 0xFF
+    n = (w >> 16) & 0x3FFF
+    body = words[i + 1:i + 1 + n + 1]
+    if op == PKT3_DRAW_INDEX_AUTO:
+      saw_draw = True
+    elif op == PKT3_MEM_WRITE:
+      if len(body) < 4:
+        raise AssertionError("malformed CP MEM_WRITE packet")
+      addr = lo32(body[0]) | ((body[1] & 0xFF) << 32)
+      if addr == color_gpu:
+        raise AssertionError("GPU add PM4 writes the color target via CP MEM_WRITE")
+      if addr == fence_gpu:
+        if not allow_fence_memwrite:
+          raise AssertionError("unexpected CP MEM_WRITE to fence in non-memwrite mode")
+        fence_writes += 1
+        if not saw_draw:
+          fence_after_draw = False
+      else:
+        raise AssertionError(f"unexpected CP MEM_WRITE to {addr:#x}")
+    elif op == PKT3_EVENT_WRITE_EOP:
+      fence_writes += 1
+  if stage != GPU_ADD_STAGE_CP and not saw_draw:
+    raise AssertionError("GPU add PM4 has no DRAW_INDEX_AUTO")
+  if stage != GPU_ADD_STAGE_CP and not fence_after_draw:
+    raise AssertionError("completion fence MEM_WRITE precedes the draw")
+  if fence_writes != 1:
+    raise AssertionError(f"expected exactly one completion fence, got {fence_writes}")
+  if not allow_fence_memwrite and any(((w >> 8) & 0xFF) == PKT3_MEM_WRITE for w in words):
+    raise AssertionError("CP MEM_WRITE present but fence memwrite mode is off")
+
+def decode_rv770_pm4(words: list[int]) -> list[str]:
+  """Offline PM4 decoder for diagnostics (Phase 9.2)."""
+  out: list[str] = []
+  names = {
+    PKT3_CONTEXT_CONTROL: "CONTEXT_CONTROL", PKT3_DRAW_INDEX_AUTO: "DRAW_INDEX_AUTO",
+    PKT3_SET_CONFIG_REG: "SET_CONFIG_REG", PKT3_SET_CONTEXT_REG: "SET_CONTEXT_REG",
+    PKT3_SET_RESOURCE: "SET_RESOURCE", PKT3_SURFACE_SYNC: "SURFACE_SYNC",
+    PKT3_EVENT_WRITE: "EVENT_WRITE", PKT3_EVENT_WRITE_EOP: "EVENT_WRITE_EOP",
+    PKT3_MEM_WRITE: "MEM_WRITE", PKT3_NOP: "NOP",
+  }
+  reg_names = {v: k for k, v in globals().items()
+               if k.startswith(("REG_",)) and isinstance(v, int)}
+  for i, w in enumerate(words):
+    if w == 0xFFFFFFFF:
+      # Legitimate body dword (e.g. SURFACE_SYNC flush mask); not a packet header.
+      out.append(f"{i:04d}: {w:08x} (data)")
+      continue
+    if w >> 30 != PKT_TYPE3:
+      out.append(f"{i:04d}: {w:08x} (data)")
+      continue
+    op = (w >> 8) & 0xFF
+    n = (w >> 16) & 0x3FFF
+    body = words[i + 1:i + 1 + n + 1]
+    tag = names.get(op, f"PKT3_{op:#x}")
+    if op in (PKT3_SET_CONTEXT_REG, PKT3_SET_CONFIG_REG) and body:
+      rname = reg_names.get(PACKET3_SET_CONTEXT_REG_START + (body[0] << 2), "?") \
+              if op == PKT3_SET_CONTEXT_REG else \
+              reg_names.get(PACKET3_SET_CONFIG_REG_START + (body[0] << 2), "?")
+      out.append(f"{i:04d}: {tag} {rname} = " +
+                 ", ".join(f"{x:#x}" for x in body[1:]))
+    elif op == PKT3_EVENT_WRITE_EOP:
+      out.append(f"{i:04d}: {tag} seq={body[-2]:#x} addr={body[1]:#x}")
+    else:
+      out.append(f"{i:04d}: {tag} " + ", ".join(f"{x:#x}" for x in body))
+  return out
 
 def build_cp_resume_regs(ring_gpu_addr: int, ring_size: int = 0x10000,
                          wb_gpu_addr: int = 0) -> list[tuple[int, int]]:
@@ -953,6 +1344,8 @@ REG_ROM_DATA = 0xAC
 REG_CG_SPLL_STATUS = 0x60c
 SPLL_CHG_STATUS = 1 << 1
 REG_MC_SEQ_MISC0 = 0x2a00
+REG_MC_SEQ_IO_DEBUG_INDEX = 0x2a44
+REG_MC_SEQ_IO_DEBUG_DATA = 0x2a48
 FW_DIR = pathlib.Path(__file__).resolve().parent / "fw"
 DEFAULT_VBIOS = FW_DIR / "hd4850_174b_e810.rom"
 # rv770d.h TLB / L2 bits (rv770_agp_enable)
@@ -2086,6 +2479,10 @@ class TerrascaleDevice:
     Requires MISC0==0x3000422a (unpatched cold ATOM). Optional finish_memory first.
     """
     self.dump_mc_mem_state("pre")
+    probe_mclk = int(os.environ.get("AMD_BOOT_VRAM_MCLK_10KHZ", "99300"), 0)
+    if probe_mclk != 99300:
+      print(f"terrascale: VRAM probe override MCLK={probe_mclk * 10} kHz", flush=True)
+    io_debug_before = self.read_io_debug() if getenv("AMD_BOOT_VRAM_IO_DEBUG", 0) else None
     # This is an explicit diagnostic, unlike the default AGP-only add path.
     try:
       self.map_vram()
@@ -2099,9 +2496,55 @@ class TerrascaleDevice:
       return False
     if getenv("AMD_BOOT_VRAM_SET_MCLK", 0):
       print("terrascale: AMD_BOOT_VRAM_SET_MCLK ignored (unsafe on this ROM)", flush=True)
+    if getenv("AMD_BOOT_VRAM_REPLAY_POWER", 0):
+      # Cold ASIC_Init capture for this HD 4850: the memory rail GPIO and
+      # rev2 SetVoltage payload must precede memory training.  Keep this
+      # explicit because replaying GPIO blindly on a warm card is unsafe.
+      try:
+        self.atom_run_cmd(9, "GPIOPinControl-MVDD", 0x0101002F)
+        self.atom_run_cmd(67, "SetVoltage-cold-memory", 0x04630001)
+        self.ensure_mpll_alive()
+      except Exception as e:
+        print(f"terrascale: cold power replay warning: {e}", flush=True)
+    if getenv("AMD_BOOT_VRAM_SET_VOLTAGE", 0):
+      # This VBIOS uses SetVoltage revision 2 (not revision 1): the first byte
+      # is the type, the second is SET_VOLTAGE mode, and the trailing u16 is a
+      # millivolt level.  Require an explicit level so a guessed rail voltage
+      # can never be applied to the board.
+      try:
+        nl, bios, ctx, exe, boot = self._atom_executor()
+        mvdd_mv = int(os.environ.get("AMD_BOOT_VRAM_MVDD_MV", "0"), 0)
+        if not mvdd_mv:
+          raise RuntimeError("AMD_BOOT_VRAM_MVDD_MV is required for SetVoltage rev2")
+        for vtype, name in ((2, "MVDDC"), (3, "MVDDQ")):
+          ps = [0] * 16
+          ps[0] = vtype | (2 << 8) | ((mvdd_mv & 0xFFFF) << 16)
+          ret = exe.execute_table(67, ps, 16)
+          print(f"terrascale: ATOM SetVoltage-{name} ret={ret} writes={boot._wcount}", flush=True)
+          self.ensure_mpll_alive()
+      except Exception as e:
+        print(f"terrascale: SetVoltage warning: {e}", flush=True)
+    if getenv("AMD_BOOT_VRAM_QUERY_VOLTAGE", 0):
+      # SetVoltage rev2 type=6/mode=0 returns the board's maximum supported
+      # level in the u16 field; this query does not change a rail.
+      try:
+        nl, bios, ctx, exe, boot = self._atom_executor()
+        for name, vtype in (("MVDDC", 2), ("MVDDQ", 3)):
+          ps = [0] * 16
+          ps[0] = 6
+          ret = exe.execute_table(67, ps, 16)
+          print(f"terrascale: ATOM QueryMax-{name} ret={ret} ps0={ps[0]:#x} level_mv={(ps[0] >> 16) & 0xffff}", flush=True)
+      except Exception as e:
+        print(f"terrascale: QueryVoltage warning: {e}", flush=True)
     if getenv("AMD_BOOT_VRAM_FINISH_MEM", 1):
       try:
-        self.finish_memory_after_mpll()
+        self.finish_memory_after_mpll(probe_mclk)
+        if io_debug_before is not None:
+          io_debug_after = self.read_io_debug()
+          changed = [(i, a, b) for i, (a, b) in enumerate(zip(io_debug_before, io_debug_after)) if a != b]
+          print(f"terrascale: IO_DEBUG changed={len(changed)}", flush=True)
+          for i, a, b in changed:
+            print(f"  io_debug[{i:#x}] {a:#010x}->{b:#010x}", flush=True)
       except Exception as e:
         print(f"terrascale: finish_memory warning: {e}", flush=True)
         self.ensure_mpll_alive()
@@ -2123,7 +2566,23 @@ class TerrascaleDevice:
           raise RuntimeError("MC hung enabling BIF")
         if self.vram is not None:
           print(f"terrascale: BAR0 read[0:8]={bytes(self.vram[0:8]).hex()}", flush=True)
-        mm_ok = self.probe_vram_mm(0)
+        if getenv("AMD_BOOT_VRAM_FAULT_MAP", 0):
+          rows = self.vram_fault_map()
+          bad = [r for r in rows if r["xor"] or (r["bar"] != 0xFFFFFFFF and r["bar"] != r["write"])]
+          print(f"terrascale: VRAM fault-map rows={len(rows)} bad={len(bad)}", flush=True)
+          zero_reads = {r["off"]: r["mm"] for r in rows if r["write"] == 0}
+          print("terrascale: VRAM zero-pattern address map " + " ".join(
+            f"{off:#x}->{val:#010x}" for off, val in zero_reads.items()), flush=True)
+          for r in bad[:64]:
+            print(f"  off={r['off']:#07x} write={r['write']:#010x} mm={r['mm']:#010x} "
+                  f"bar={r['bar']:#010x} xor={r['xor']:#010x}", flush=True)
+        if getenv("AMD_BOOT_VRAM_SWEEP", 0):
+          mm_ok = True
+          for off, pat in ((0x0, 0xA5A55A5A), (0x4, 0x5AA5A55A),
+                           (0x100, 0xC33C9696), (0x1000, 0x3CC36969)):
+            mm_ok = self.probe_vram_mm(off, pat) and mm_ok
+        else:
+          mm_ok = self.probe_vram_mm(0)
         bif_ok = self.probe_bar0(force=True)
       else:
         self.wreg(R600_BIF_FB_EN, 0)
@@ -2140,6 +2599,37 @@ class TerrascaleDevice:
     ok = mm_ok or bif_ok
     print(f"terrascale: vram_probe mm={mm_ok} bar0={bif_ok}", flush=True)
     return ok
+
+  def read_io_debug(self, count: int = 0x200) -> list[int]:
+    """Read MC_SEQ_IO_DEBUG content without changing the memory state."""
+    out = []
+    for i in range(count):
+      self.wreg(REG_MC_SEQ_IO_DEBUG_INDEX, i)
+      out.append(self.rreg(REG_MC_SEQ_IO_DEBUG_DATA))
+    return out
+
+  def vram_fault_map(self) -> list[dict[str, int]]:
+    """Characterize local VRAM data/address faults through MM_INDEX."""
+    rows: list[dict[str, int]] = []
+    offsets = [0] + [1 << n for n in range(2, 13)]
+    # Keep the diagnostic bounded while still covering every DQ bit and
+    # address bit; add walking-one data explicitly.
+    patterns = [0, 0xFFFFFFFF, 0xAAAAAAAA, 0x55555555]
+    patterns += [1 << n for n in range(32)]
+    patterns += [0xFFFFFFFF ^ (1 << n) for n in range(32)]
+    for off in offsets:
+      for pat in patterns:
+        self.wreg(0x0, (off & 0x7FFFFFFF) | 0x80000000)
+        self.wreg(0x4, pat)
+        self.wreg(0x2C14, 0)  # HDP_DEBUG1 flush
+        self.wreg(0x0, (off & 0x7FFFFFFF) | 0x80000000)
+        got_mm = self.rreg(0x4)
+        got_bar = 0xFFFFFFFF
+        if self.vram is not None:
+          got_bar = struct.unpack("<I", bytes(self.vram[off:off + 4]))[0]
+        rows.append({"off": off, "write": pat, "mm": got_mm,
+                     "bar": got_bar, "xor": (pat ^ got_mm) & 0xFFFFFFFF})
+    return rows
 
   def boot(self):
     if self._booted:
@@ -2220,6 +2710,26 @@ class TerrascaleDevice:
     """
     if self.chip.family != CHIP_RV770:
       raise NotImplementedError("graphics resource init is RV770-specific")
+    # A failed pre-EOP draw can leave SH/VGT busy while CP still advances.  Do
+    # the same graphics-unit soft reset Linux's r600_gpu_soft_reset performs;
+    # CP is halted only while the reset bits are asserted, and MC/VRAM routing
+    # is untouched.
+    self.wreg(REG_CP_ME_CNTL, CP_ME_HALT | CP_PFP_HALT)
+    gfx_reset = ((1 << 1) | (1 << 3) | (1 << 5) | (1 << 6) |
+                 (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) |
+                 (1 << 12) | (1 << 13) | (1 << 14))
+    self.wreg(REG_GRBM_SOFT_RESET, gfx_reset)
+    _ = self.rreg(REG_GRBM_SOFT_RESET)
+    # Linux's r600_gpu_soft_reset holds the graphics reset for 50 ms.  A
+    # 100-us pulse can leave RV770 SH/VGT state latched, especially after a
+    # prior timed-out draw.
+    time.sleep(0.050)
+    self.wreg(REG_GRBM_SOFT_RESET, 0)
+    # CP_ME_CNTL has only halt controls on RV770; Linux resumes it with zero.
+    # Writing 0xFF sets reserved low bits and can leave the graphics parser in
+    # an undefined state even though simple ring packets appear to work.
+    self.wreg(REG_CP_ME_CNTL, 0)
+    self.pci.drain_mmio(self.mmio_bar)
     regs = (
       (0x8C00, 0xE4000007),  # SQ_CONFIG: VC/EXPORT_SRC_C/DX9 + stage priorities
       (0x8C04, 0x00600060),  # SQ_GPR_RESOURCE_MGMT_1: PS=VS=96
@@ -2227,99 +2737,240 @@ class TerrascaleDevice:
       (0x8C0C, 0x1F1F3E7C),  # SQ_THREAD_RESOURCE_MGMT: PS/VS/GS/ES
       (0x8C10, 0x00800080),  # SQ_STACK_RESOURCE_MGMT_1: PS/VS=128
       (0x8C14, 0x00800080),  # SQ_STACK_RESOURCE_MGMT_2: GS/ES=128
+      # rv770_gpu_init defaults required by the shader/export and scan
+      # converters; these are not context registers and survive the draw
+      # packet reset only if explicitly seeded.
+      (0x8CF0, 0x08E00120),  # SQ_MS_FIFO_SIZES
+      (0x900C, 0x001B031F),  # SX_EXPORT_BUFFER_SIZES (128/16/112 dwords)
+      (0x8BCC, 0x130300F9),  # PA_SC_FIFO_SIZE (RV770)
+      (0x913C, 0x00000004),  # SPI_CONFIG_CNTL_1 VTX_DONE_DELAY
+      (0x88C4, 0x000000C2),  # VGT_CACHE_INVALIDATION: VC+TC, ES/GS auto
+      (0x8974, 0x00000001),  # VGT_NUM_INSTANCES
+      (0x88CC, 0x00000080),  # VGT_ES_PER_GS
+      (0x88C8, 0x00000100),  # VGT_GS_PER_ES
+      (0x88E8, 0x00000002),  # VGT_GS_PER_VS
+      (0x88D4, 0x00000010),  # VGT_GS_VERTEX_REUSE
+      # rv770_gpu_init: dynamic GPR ring sizes, max_gprs=256 => 152 per bank.
+      (0x8DB0, 0x98989898), (0x8DB4, 0x98989898),
+      (0x8DB8, 0x98989898), (0x8DBC, 0x98989898),
+      (0x8DC0, 0x98989898), (0x8DC4, 0x98989898),
+      (0x8DC8, 0x98989898), (0x8DCC, 0x98989898),
     )
     for reg, val in regs:
       self.wreg(reg, val)
     self.pci.drain_mmio(self.mmio_bar)
     observed = tuple(self.rreg(reg) for reg, _ in regs)
-    if observed != tuple(val for _, val in regs):
-      raise RuntimeError(f"RV770 SQ resource init readback mismatch: {observed!r}")
+    # VGT_NUM_INSTANCES is write-only/read-as-zero on this RV770; all other
+    # resource/cache registers must retain their programmed values.
+    for (reg, want), got in zip(regs, observed):
+      if reg != 0x8974 and got != want:
+        raise RuntimeError(f"RV770 SQ resource init readback mismatch: {reg:#x} {got:#x} != {want:#x}")
     print("terrascale: RV770 SQ graphics resources initialized", flush=True)
 
   def prepare_gpu_add_buffers(self, a=(1.0, 2.0, 3.0, 4.0),
-                              b=(10.0, 20.0, 30.0, 40.0)) -> dict[str, int]:
+                               b=(10.0, 20.0, 30.0, 40.0),
+                               stage: str = "add") -> dict[str, int]:
     """Allocate the real RV770 graphics-add inputs, programs, and target in AGP.
 
     This deliberately does *not* emit graphics packets.  It is the last safe
     preflight before a draw: all data consumed or produced by the GPU is host
     memory reached via the proven AGP aperture, and `a`/`b` are copied as inputs
     only.  No CPU sum is calculated or stored.
+
+    The color target is filled with a 0xA5 canary so that "no write",
+    "wrote zero" and "wrote the expected value" are distinguishable outcomes.
+    A separate page holds the completion fence.
     """
     if not self._booted:
       self.boot()
     av, bv = tuple(map(float, a)), tuple(map(float, b))
     if len(av) != 4 or len(bv) != 4:
       raise ValueError("GPU add needs exactly four floats in each input vector")
-    ps, vs = compile_rv770_add_blob(), compile_rv770_vs_blob()
-    fetch = build_rv770_vertex_fetch_blob()
+    # The constant PS stage must still use the real fetched fullscreen triangle;
+    # a no-fetch VS emits one identical position per vertex (a degenerate
+    # triangle), so it cannot test raster/CB output.
+    constant_vs = stage == GPU_ADD_STAGE_CONSTANT and bool(getenv("AMD_GPU_ADD_CONSTANT_VS", 0))
+    empty_vs = bool(getenv("AMD_GPU_ADD_EMPTY_VS", 0))
+    streamout = stage == GPU_ADD_STAGE_STREAM
+    if getenv("AMD_GPU_ADD_EMPTY_PS", 0) or streamout:
+      ps = build_rv770_empty_ps_blob()
+    elif stage == GPU_ADD_STAGE_CONSTANT:
+      ps = compile_rv770_constant_ps_blob()
+    elif stage == GPU_ADD_STAGE_PARAM0:
+      ps = compile_rv770_param0_ps_blob()
+    else:
+      ps = compile_rv770_add_blob()
+    if empty_vs:
+      vs = build_rv770_empty_vs_blob()
+    elif streamout:
+      vs = compile_rv770_stream_add_vs_blob()
+    else:
+      vs = compile_rv770_constant_vs_blob() if constant_vs else compile_rv770_vs_blob()
+    fetch = (build_rv770_empty_ps_blob() if empty_vs else
+             (build_rv770_noop_fetch_blob() if constant_vs else build_rv770_vertex_fetch_blob()))
 
     vs_gpu, vs_mem, _ = self.alloc_agp(PAGE_SIZE)
     ps_gpu, ps_mem, _ = self.alloc_agp(PAGE_SIZE)
     fetch_gpu, fetch_mem, _ = self.alloc_agp(PAGE_SIZE)
     vtx_gpu, vtx_mem, _ = self.alloc_agp(PAGE_SIZE)
     color_gpu, color_mem, _ = self.alloc_agp(PAGE_SIZE)
+    fence_gpu, fence_mem, _ = self.alloc_agp(PAGE_SIZE)
     vs_mem[0:len(vs)], ps_mem[0:len(ps)], fetch_mem[0:len(fetch)] = vs, ps, fetch
     # One oversize triangle covers the 1x1 color target. Every vertex carries
     # identical operands, making interpolation preserve the requested vectors.
     positions = ((-1.0, -1.0, 0.0, 1.0), (3.0, -1.0, 0.0, 1.0), (-1.0, 3.0, 0.0, 1.0))
     vertices = b"".join(struct.pack("12f", *(p + av + bv)) for p in positions)
     vtx_mem[0:len(vertices)] = vertices
-    color_mem[0:16] = bytes(16)
+    # Canary fill: any byte still 0xA5 after a draw means CB never wrote.
+    color_mem[0:PAGE_SIZE] = bytes([COLOR_CANARY]) * PAGE_SIZE
+    fence_mem[0:PAGE_SIZE] = bytes(PAGE_SIZE)
     for mem, size in ((vs_mem, len(vs)), (ps_mem, len(ps)), (fetch_mem, len(fetch)),
-                      (vtx_mem, len(vertices)), (color_mem, 16)):
-      sysmem_dma_flush(mem, size)
-    out = {"vs": vs_gpu, "ps": ps_gpu, "fetch": fetch_gpu, "vertices": vtx_gpu, "color": color_gpu,
-           "vs_bytes": len(vs), "ps_bytes": len(ps), "fetch_bytes": len(fetch), "vertex_bytes": len(vertices)}
+                      (vtx_mem, len(vertices)), (color_mem, PAGE_SIZE), (fence_mem, PAGE_SIZE)):
+      sysmem_sync_for_device(mem, size)
+    out = {"vs": vs_gpu, "ps": ps_gpu, "fetch": fetch_gpu, "vertices": vtx_gpu,
+           "color": color_gpu, "fence": fence_gpu,
+           "vs_bytes": len(vs), "ps_bytes": len(ps), "fetch_bytes": len(fetch),
+           "vertex_bytes": len(vertices)}
     # Retain mappings until completion polling has observed the GPU-written
-    # color target.  They are inputs/outputs only; no CPU result is stored.
+    # color target and fence.  They are inputs/outputs only; no CPU result is stored.
     self._gpu_add_mappings = {"vs": vs_mem, "ps": ps_mem, "fetch": fetch_mem,
-                              "vertices": vtx_mem, "color": color_mem}
+                              "vertices": vtx_mem, "color": color_mem, "fence": fence_mem}
     print("terrascale: GPU-add preflight (no draw) " +
-          " ".join(f"{k}={v:#x}" if k in ("vs", "ps", "fetch", "vertices", "color") else f"{k}={v}"
+          " ".join(f"{k}={v:#x}" if k in ("vs", "ps", "fetch", "vertices", "color", "fence") else f"{k}={v}"
                    for k, v in out.items()), flush=True)
     return out
 
-  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0)) -> list[float]:
+  def _next_fence_seq(self) -> int:
+    seq = getattr(self, "_fence_seq", 0) + 1
+    self._fence_seq = seq
+    return seq
+
+  def _gpu_add_expected(self, stage: str, a, b) -> list[float] | None:
+    """CPU oracle, computed only after submission and never uploaded."""
+    if stage == GPU_ADD_STAGE_CONSTANT:
+      return [0.25, -0.5, 3.0, 1.0]
+    if stage == GPU_ADD_STAGE_PARAM0:
+      return [float(x) for x in a]
+    if stage == GPU_ADD_STAGE_ADD:
+      return [float(x) + float(y) for x, y in zip(a, b)]
+    if stage == GPU_ADD_STAGE_STREAM:
+      return [float(x) + float(y) for x, y in zip(a, b)]
+    return None  # cp stage
+
+  def dump_gpu_add_registers(self, tag: str = "") -> dict:
+    """Snapshot graphics-relevant status/context registers (Phase 9.1)."""
+    regs = {
+      "CP_RB_RPTR": REG_CP_RB_RPTR, "CP_RB_WPTR": REG_CP_RB_WPTR,
+      "CP_ME_CNTL": REG_CP_ME_CNTL, "GRBM_STATUS": REG_GRBM_STATUS,
+      "CB_COLOR0_BASE": REG_CB_COLOR0_BASE, "CB_COLOR0_INFO": REG_CB_COLOR0_INFO,
+      "CB_COLOR0_SIZE": REG_CB_COLOR0_SIZE, "CB_TARGET_MASK": REG_CB_TARGET_MASK,
+      "CB_SHADER_MASK": REG_CB_SHADER_MASK, "CB_COLOR_CONTROL": REG_CB_COLOR_CONTROL,
+      "SPI_PS_IN_CONTROL_0": REG_SPI_PS_IN_CONTROL_0,
+      "SQ_CONFIG": 0x8C00, "SQ_THREAD_RESOURCE_MGMT": 0x8C0C,
+      "DB_DEPTH_CONTROL": REG_DB_DEPTH_CONTROL,
+      "PA_SC_MODE_CNTL": REG_PA_SC_MODE_CNTL,
+    }
+    info = {k: self.rreg(v) for k, v in regs.items()}
+    print("terrascale: gfx regs" + (f" {tag}" if tag else "") + " " +
+          " ".join(f"{k}={v:#x}" for k, v in info.items()), flush=True)
+    return info
+
+  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0),
+              stage: str = "add") -> list[float] | None:
     """Run a real GPU vector add, never a CPU fallback.
 
     RV770 has the classic graphics CP but not Evergreen's LS compute pipeline.
     A valid implementation needs an RV770 CF+ALU shader, GFX resource bindings,
     a draw/dispatch packet sequence, and a GPU-produced AGP result.  Do not
     substitute PKT3_MEM_WRITE: it merely writes literal packet data.
+
+    The `stage` ladder isolates pipeline stages: ``cp`` proves only the
+    completion path, ``constant`` proves draw/raster/PS/CB, ``param0`` adds the
+    fetch/VS/SPI linkage, and ``add`` is the full GPU arithmetic.
     """
     if self.chip.family != CHIP_RV770:
       raise NotImplementedError("real add currently targets the attached RV770 / HD 4850")
-    bufs = self.prepare_gpu_add_buffers(a, b)
+    if stage not in GPU_ADD_STAGES:
+      raise ValueError(f"unknown GPU-add stage {stage!r}; choose {GPU_ADD_STAGES}")
+    bufs = self.prepare_gpu_add_buffers(a, b, stage=stage)
     self.init_rv770_graphics_resources()
+    if getenv("AMD_GPU_ADD_ENABLE_BIF", 0):
+      # Diagnostic: enable the framebuffer read/write gates while retaining
+      # the FB range at the parked 0xE0... address.  This does not map or touch
+      # BAR0; it tests whether CB color writes require BIF even for AGP targets.
+      self.wreg(R600_BIF_FB_EN, R600_FB_READ_EN | R600_FB_WRITE_EN)
+      self.pci.drain_mmio(self.mmio_bar)
+      print(f"terrascale: GPU-add BIF enabled={self.rreg(R600_BIF_FB_EN):#x}", flush=True)
+    fence_mode = os.environ.get("AMD_GPU_ADD_FENCE_MODE", "eop")
+    allow_fence_memwrite = fence_mode in ("wait-memwrite", "raw-memwrite")
+    full_gfx_init = getenv("AMD_GPU_ADD_FULL_GFX_INIT", 0)
+    fence_sequence = self._next_fence_seq()
     words = build_rv770_add_draw(bufs["vs"], bufs["ps"], bufs["fetch"],
-                                 bufs["vertices"], bufs["color"])
-    # This is the sole execution path: vertex fetch + VS + four PS ALU ADDs +
-    # color export.  In particular, it must never contain PKT3_MEM_WRITE.
-    if any(((w >> 8) & 0xFF) == PKT3_MEM_WRITE for w in words):
-      raise AssertionError("GPU add PM4 unexpectedly contains CP MEM_WRITE")
+                                 bufs["vertices"], bufs["color"],
+                                 stage=stage, fence_gpu=bufs["fence"],
+                                 fence_sequence=fence_sequence, fence_mode=fence_mode,
+                                 full_gfx_init=full_gfx_init,
+                                 constant_vs=bool(getenv("AMD_GPU_ADD_CONSTANT_VS", 0)),
+                                 empty_vs=bool(getenv("AMD_GPU_ADD_EMPTY_VS", 0)))
+    validate_gpu_add_pm4(words, color_gpu=bufs["color"], fence_gpu=bufs["fence"],
+                         stage=stage, allow_fence_memwrite=allow_fence_memwrite)
     color_mem = self._gpu_add_mappings["color"]
+    fence_mem = self._gpu_add_mappings["fence"]
+    if getenv("AMD_GPU_ADD_DUMP_PM4", 0):
+      print("terrascale: RV770 draw PM4:", flush=True)
+      for line in decode_rv770_pm4(words):
+        print("  pm4 " + line, flush=True)
     self._ring_write_words(words)
     self._commit_wptr()
+    if getenv("AMD_GPU_ADD_DUMP_REGISTERS", 0):
+      self.dump_gpu_add_registers("after-submit")
+    # Poll the completion fence, not the color target.  This distinguishes a
+    # hang (fence never updates) from a draw that completed but wrote nothing.
     deadline = time.time() + float(os.environ.get("AMD_BOOT_ADD_WAIT_S", "3"))
-    result = [0.0, 0.0, 0.0, 0.0]
+    fenced = False
     while time.time() < deadline:
-      sysmem_dma_flush(color_mem, 16)
-      result = list(struct.unpack("4f", bytes(color_mem[0:16])))
-      if any(x != 0.0 for x in result):
+      sysmem_sync_for_cpu(fence_mem, 16)
+      if struct.unpack("<I", bytes(fence_mem[0:4]))[0] == fence_sequence:
+        fenced = True
         break
-      time.sleep(0.01)
-    # CPU arithmetic appears only after completion, as an independent oracle;
-    # the computed values were never uploaded to the output allocation.
-    expected = [float(x) + float(y) for x, y in zip(a, b)]
+      time.sleep(0.005)
+    # Optional diagnostic delay for raw-fence experiments: raw MEM_WRITE is
+    # intentionally not a graphics completion primitive, so allow the draw
+    # engine time to retire before inspecting the target.
+    post_delay = float(os.environ.get("AMD_GPU_ADD_POST_DELAY_S", "0"))
+    if post_delay > 0:
+      time.sleep(post_delay)
+    sysmem_sync_for_cpu(color_mem, 16)
+    result = list(struct.unpack("4f", bytes(color_mem[0:16])))
+    if stage == GPU_ADD_STAGE_CP:
+      if not fenced:
+        raise RuntimeError("RV770 GPU-add cp stage: completion fence never signaled")
+      print(f"result=cp_stage fence={fence_sequence:#x} path=rv770_fence_only", flush=True)
+      return None
+    # Classify the color page for actionable diagnostics.
+    raw = bytes(color_mem[0:16])
+    canary_intact = (raw == bytes([COLOR_CANARY]) * 16)
+    if not fenced:
+      rptr = self.rreg(REG_CP_RB_RPTR); wptr = self.rreg(REG_CP_RB_WPTR)
+      grbm = self.rreg(REG_GRBM_STATUS)
+      raise RuntimeError(
+        f"RV770 GPU add ({stage}) fence timeout: fence={fenced} "
+        f"color_canary_intact={canary_intact} got={result}; "
+        f"CP_RPTR={rptr:#x} CP_WPTR={wptr:#x} GRBM_STATUS={grbm:#x}")
+    expected = self._gpu_add_expected(stage, a, b)
+    if canary_intact:
+      grbm = self.rreg(REG_GRBM_STATUS)
+      raise RuntimeError(
+        f"RV770 GPU add ({stage}) draw completed but color target unchanged "
+        f"(canary intact, got={result}, GRBM_STATUS={grbm:#x}); "
+        f"CB/ROP/rasterizer produced no write")
     if not all(math.isclose(got, want, rel_tol=1e-5, abs_tol=1e-5)
                for got, want in zip(result, expected)):
-      rptr = self.rreg(REG_CP_RB_RPTR)
-      wptr = self.rreg(REG_CP_RB_WPTR)
-      grbm = self.rreg(REG_GRBM_STATUS)
-      raise RuntimeError("RV770 GPU add mismatch/timeout: "
-                         f"got {result}, expected {expected}; CP_RPTR={rptr:#x} "
-                         f"CP_WPTR={wptr:#x} GRBM_STATUS={grbm:#x}")
-    print(f"result={result} expected={expected} path=rv770_vs_ps_alu_agp", flush=True)
+      raise RuntimeError(
+        f"RV770 GPU add ({stage}) mismatch: got {result}, expected {expected} "
+        f"(canary_intact={canary_intact})")
+    print(f"result={result} expected={expected} stage={stage} "
+          f"path=rv770_vs_ps_alu_agp", flush=True)
     return result
 
 def selftest(chip: ChipInfo):
@@ -2338,7 +2989,8 @@ def selftest(chip: ChipInfo):
   rv770_blob = compile_rv770_add_blob() if rv770_asm else b""
   rv770_vs_blob = compile_rv770_vs_blob() if rv770_asm else b""
   rv770_fetch_blob = build_rv770_vertex_fetch_blob()
-  rv770_draw = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000)
+  rv770_draw = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
+                                    fence_gpu=0x25000)
   assert len(rv770_blob) in (0, 64)
   assert len(rv770_vs_blob) in (0, 48)
   assert len(rv770_fetch_blob) == 80
@@ -2349,7 +3001,57 @@ def selftest(chip: ChipInfo):
   assert [(fetch_dw[i] >> 8) & 0xFF for i in (8, 12, 16)] == [160, 160, 160]
   assert [fetch_dw[i] & 0x7F for i in (9, 13, 17)] == [1, 2, 3]
   assert any(((w >> 8) & 0xFF) == PKT3_DRAW_INDEX_AUTO for w in rv770_draw)
-  assert not any(w & PACKET3_COMPUTE_MODE for w in rv770_draw if w >> 30 == PKT_TYPE3)
+  # A 0xffffffff body dword (e.g. SURFACE_SYNC flush mask) reads as a type3
+  # header under a naive top-bit test; exclude it from the compute-mode check.
+  assert not any(w & PACKET3_COMPUTE_MODE for w in rv770_draw
+                 if w >> 30 == PKT_TYPE3 and w != 0xFFFFFFFF)
+  # CB_COLOR_CONTROL / color-info helpers and their decoded fields.
+  assert rv770_cb_color_control() == 0x00CC0000
+  assert ((rv770_cb_color_control() >> 4) & 7) == 0
+  assert ((rv770_cb_color_control() >> 16) & 0xFF) == 0xCC
+  cinfo = rv770_color_info_rgba32_float()
+  assert ((cinfo >> 2) & 0x3F) == 0x23
+  assert ((cinfo >> 8) & 0xF) == 1
+  assert ((cinfo >> 12) & 0xF) == 7
+  assert ((cinfo >> 24) & 1) == 1
+  # Stage ladder: each graphics stage emits one draw + exactly one completion
+  # fence and never a MEM_WRITE to the color target.
+  for st in (GPU_ADD_STAGE_ADD, GPU_ADD_STAGE_CONSTANT, GPU_ADD_STAGE_PARAM0):
+    w = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
+                             stage=st, fence_gpu=0x25000, fence_sequence=7)
+    validate_gpu_add_pm4(w, color_gpu=0x24000, fence_gpu=0x25000, stage=st)
+  # The cp stage proves only the completion fence: no draw, one EOP.
+  w_cp = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
+                              stage=GPU_ADD_STAGE_CP, fence_gpu=0x25000, fence_sequence=9)
+  assert not any(((x >> 8) & 0xFF) == PKT3_DRAW_INDEX_AUTO for x in w_cp)
+  validate_gpu_add_pm4(w_cp, color_gpu=0x24000, fence_gpu=0x25000, stage=GPU_ADD_STAGE_CP)
+  # Reject a CP MEM_WRITE to the color target even in memwrite mode.  Build a
+  # valid draw, then append a forbidden MEM_WRITE to the color allocation.
+  bad = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
+                             fence_gpu=0x25000, fence_sequence=1)
+  _pb = PM4Builder(compute=False)
+  _pb.pkt3(PKT3_MEM_WRITE, 0x24000, 0, 0, 0)
+  bad += _pb.words
+  raised = False
+  try:
+    validate_gpu_add_pm4(bad, color_gpu=0x24000, fence_gpu=0x25000, stage=GPU_ADD_STAGE_ADD,
+                        allow_fence_memwrite=True)
+  except AssertionError as e:
+    raised = "color target" in str(e)
+  assert raised, "validator must reject a MEM_WRITE to the color target"
+  # The sanctioned memwrite-mode fence (MEM_WRITE to the fence only) is accepted.
+  mw = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
+                            stage=GPU_ADD_STAGE_ADD, fence_gpu=0x25000,
+                            fence_sequence=1, fence_mode="wait-memwrite")
+  validate_gpu_add_pm4(mw, color_gpu=0x24000, fence_gpu=0x25000, stage=GPU_ADD_STAGE_ADD,
+                       allow_fence_memwrite=True)
+  # Constant / param0 PS compile if the R600 backend is available.
+  if rv770_asm:
+    cps = compile_rv770_constant_ps_blob()
+    p0 = compile_rv770_param0_ps_blob()
+    assert len(cps) > 0 and len(p0) > 0
+    # constant PS exports a distinctive vec4, param0 exports its input.
+    assert b"EXPORT" in compile_rv770_add_shader().encode()
   print(f"selftest=ok chip={chip.name} me_words={len(me)} eg_ib={len(ib)} "
         f"ls_compute={int(chip.has_ls_compute)} rv770_alu_add={int(bool(rv770_asm))} "
         f"rv770_shader_bytes={len(rv770_blob)} rv770_vs_bytes={len(rv770_vs_blob)} "
@@ -2433,6 +3135,39 @@ def parse_payloads(argv: list[str]) -> list[tuple[float, float, float, float]]:
       payload = parse_vec4(arg.split("=", 1)[1])
   return [payload]
 
+def parse_gpu_add_cli(argv: list[str]) -> tuple[str, int]:
+  """Parse the GPU-add experimental switches into (stage, repeat).
+
+  Flags are also mirrored into ``AMD_GPU_ADD_*`` env vars so ``run_add`` (which
+  already reads them) behaves identically whether set via CLI or environment.
+  """
+  stage = os.environ.get("AMD_GPU_ADD_STAGE", "add")
+  repeat = int(os.environ.get("AMD_GPU_ADD_REPEAT", "1"))
+  for i, arg in enumerate(argv):
+    if arg == "--gpu-add-stage" and i + 1 < len(argv):
+      stage = argv[i + 1]
+    elif arg.startswith("--gpu-add-stage="):
+      stage = arg.split("=", 1)[1]
+    elif arg == "--gpu-add-fence-mode" and i + 1 < len(argv):
+      os.environ["AMD_GPU_ADD_FENCE_MODE"] = argv[i + 1]
+    elif arg.startswith("--gpu-add-fence-mode="):
+      os.environ["AMD_GPU_ADD_FENCE_MODE"] = arg.split("=", 1)[1]
+    elif arg == "--gpu-add-repeat" and i + 1 < len(argv):
+      repeat = int(argv[i + 1])
+    elif arg.startswith("--gpu-add-repeat="):
+      repeat = int(arg.split("=", 1)[1])
+    elif arg == "--gpu-add-full-gfx-init":
+      os.environ["AMD_GPU_ADD_FULL_GFX_INIT"] = "1"
+    elif arg == "--gpu-add-no-full-gfx-init":
+      os.environ["AMD_GPU_ADD_FULL_GFX_INIT"] = "0"
+    elif arg == "--gpu-add-dump-pm4":
+      os.environ["AMD_GPU_ADD_DUMP_PM4"] = "1"
+    elif arg == "--gpu-add-dump-registers":
+      os.environ["AMD_GPU_ADD_DUMP_REGISTERS"] = "1"
+  if stage not in GPU_ADD_STAGES:
+    raise SystemExit(f"--gpu-add-stage must be one of {GPU_ADD_STAGES}")
+  return stage, repeat
+
 def main():
   argv = sys.argv[1:]
   if any(a in ("--chip=auto", "--auto") for a in argv) or os.environ.get("TS_CHIP", "").lower() == "auto":
@@ -2443,6 +3178,7 @@ def main():
       os.environ.setdefault("TS_CHIP", "hd4850")
     chip = resolve_chip(argv)
   wait_s = parse_wait(argv)
+  stage, repeat = parse_gpu_add_cli(argv)
 
   if "--selftest" in argv:
     selftest(chip or CHIPS["hd4850"]); return
@@ -2510,7 +3246,11 @@ def main():
     if getenv("AMD_BOOT_ATOM", 1):
       with contextlib.suppress(Exception):
         # Prefer existing post-ATOM clocks; full ATOM needs cold CHG.
-        if (dev.rreg(0x624) & 0x7F) == 0:
+        # A cold card can report a nonzero reset CLKF while the rest of
+        # ASIC_Init is still unrun (MEMSIZE=0, MISC0=0).  CHG is the reliable
+        # indicator that the full VBIOS memory sequence must execute.
+        cold_chg = bool(dev.rreg(REG_CG_SPLL_STATUS) & SPLL_CHG_STATUS)
+        if cold_chg or (dev.rreg(0x624) & 0x7F) == 0:
           try:
             dev.atom_asic_init()
           except Exception as e:
@@ -2529,7 +3269,7 @@ def main():
   if "--gpu-add-preflight" in argv:
     dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
     a, b = parse_cases(argv)[0]
-    dev.prepare_gpu_add_buffers(a, b)
+    dev.prepare_gpu_add_buffers(a, b, stage=stage)
     return
 
   if "--test" in argv:
@@ -2539,9 +3279,11 @@ def main():
   cases = parse_cases(argv)
   try:
     dev = TerrascaleDevice(chip=chip, wait_s=wait_s)
-    print(f"pci={dev.vid:04x}:{dev.did:04x} chip={dev.chip.name}", flush=True)
+    print(f"pci={dev.vid:04x}:{dev.did:04x} chip={dev.chip.name} stage={stage} "
+          f"repeat={repeat}", flush=True)
     for a, b in cases:
-      dev.run_add(a, b)
+      for _ in range(max(1, repeat)):
+        dev.run_add(a, b, stage=stage)
   except Exception as e:
     print(f"add failed: {e}", file=sys.stderr)
     sys.exit(1)
