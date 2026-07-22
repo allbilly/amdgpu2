@@ -3959,7 +3959,7 @@ class TerrascaleDevice:
     else:
       sysmem_dma_flush(pool_mem, 16)
     result = list(struct.unpack("<4f", bytes(pool_mem[pool_off:pool_off + 16])))
-    expected = [float(x) + float(y) for x, y in zip(a, b)]
+    expected = [OP(float(x), float(y)) for x, y in zip(a, b)]
     if noop or store_only or atomic_only:
       scan = bytes(pool_mem[pool_off:pool_off + PAGE_SIZE])
       store_at = scan.find(struct.pack("<4f", 11.0, 22.0, 33.0, 44.0))
@@ -3977,8 +3977,8 @@ class TerrascaleDevice:
       return result
     if not all(math.isclose(got, want, rel_tol=1e-6, abs_tol=1e-6)
                for got, want in zip(result, expected)):
-      raise RuntimeError(f"Redwood GPU add mismatch: got {result}, expected {expected}")
-    print(f"gpu_add result={result} expected={expected} engine=Redwood-LS", flush=True)
+      raise RuntimeError(f"Redwood GPU {OP_NAME} mismatch: got {result}, expected {expected}")
+    print(f"gpu_{OP_NAME} result={result} expected={expected} engine=Redwood-LS", flush=True)
     return result
 
   def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0),
